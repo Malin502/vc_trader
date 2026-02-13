@@ -1,0 +1,142 @@
+# ============================================================
+# AIVC Trade - Phase A  Configuration
+# ============================================================
+
+exchange:
+  name: binance
+  symbols:
+    - BTCUSDC
+    - ETHUSDC
+  market_type: spot          # 現物のみ
+
+timeframes:
+  signal: 1h                 # シグナル生成足
+  execution: 5m              # 執行フィルタ足
+  monitor: 5m                # ストップ更新監視足
+
+position:
+  max_concurrent: 1          # 同時保有最大数
+  cooldown_hours: 6          # 決済後の再エントリ禁止(h)
+  stop_loss_cooldown_hours: 12
+  regime_exit_cooldown_hours: 8
+
+costs:
+  commission_bps: 10         # 片道手数料 (bps)  = 0.10%
+  slippage_bps: 5            # 片道スリッページ (bps) = 0.05%
+  roundtrip_cost_bps: 30     # 往復合計 (bps) = 0.30%
+
+# ---------- 1h Indicator Parameters ----------
+indicators_1h:
+  ema_fast_period: 20
+  ema_slow_period: 50
+  ema_slope_lookback: 6      # slope 計算用 lookback (bars)
+  adx_period: 14
+  atr_period: 14
+  atrp_z_window: 200         # atrp z-score rolling window
+  donchian_period: 20
+  volume_sma_period: 20
+  swing_low_period: 10       # recent_swing_low 用
+
+# ---------- 5m Indicator Parameters ----------
+indicators_5m:
+  ema_fast_period: 20
+  ema_slow_period: 50
+  atr_period: 14
+  spread_proxy_window: 20
+  micro_vol_percentile_window: 200
+  micro_vol_percentile_q: 90 # percentile threshold
+
+# ---------- Regime Thresholds ----------
+regime:
+  chaos_atrp_z: 2.0
+  chaos_adx_trend_down: 25
+  chaos_drop_multiplier: 3.0
+  chaos_drop_lookback: 15     # 15h
+  trend_slope_min: 0.0015
+  trend_adx_min: 18
+  trend_atrp_z_min: -0.5
+
+# ---------- Entry Conditions ----------
+entry:
+  pullback_threshold: 0.015  # |close - ema_fast|/close <= 1.5%
+  volume_above_sma: true
+  micro_vol_filter: true
+  regime_hysteresis_bars: 2
+  max_pre_entry_ret_3h: null    # nullで無効化（3h/24hどちらか一方で運用）
+  max_pre_entry_ret_24h: 0.03   # 直近24hの上昇率上限 (3.0%)
+
+entry_quality:
+  enabled: true
+  min_adx: 20
+  min_atrp: 0.006
+  min_atrp_z: -0.2
+  min_volume_ratio: 1.05
+  min_slope: 0.0018
+
+# ---------- Exit Conditions ----------
+exit:
+  stop_atr_multiplier: 2.2
+  stop_structure_buffer: 0.3 # atr * 0.3
+  trail_start_atr: 1.0      # 含み益 >= 1.0*atr で追随開始
+  trail_start_mfe_pct: 2.0  # MFE >= 2.0% になるまで追随開始しない
+  trail_atr_multiplier: 2.5
+  trail_min_holding_hours: 2
+  trail_min_atrp: 0.004
+  regime_exit_confirm_bars: 3  # TREND_UP離脱が3本連続でEXIT
+  regime_exit_profit_confirm_bars: 6 # 含み益中のRANGEは6本連続でEXIT
+  chaos_exit_confirm_bars: 1 # CHAOSは原則即時EXIT
+
+# ---------- Partial Take-Profit / Runner Mode ----------
+partial_tp:
+  enabled: true
+  threshold_pct: 2.0           # 含み益 +2.0% で50%利確
+  ratio: 0.5                   # 利確割合
+
+runner:
+  buffer_pct: 1.0              # ランナーの利益バッファ閾値 (%)
+  range_exit_max_off_bars: 6   # バッファ有り時のRANGE最大猶予バー数
+  trail_activate_mfe_pct: 2.0  # ランナートレール有効化MFE閾値 (%)
+  trail_atr_k: 2.0             # ランナートレール ATR乗数
+
+# ---------- Position Sizing ----------
+sizing:
+  risk_per_trade: 0.05       # 口座資産の 5%
+  max_notional_pct: 0.95     # 最大投下比率
+
+# ---------- Symbol Score Weights ----------
+score:
+  w_slope: 0.6
+  w_adx: 0.4
+  w_atrp_z: -0.3
+
+# ---------- Order ----------
+order:
+  type: MARKET               # MARKET / LIMIT
+  max_entry_slippage_bps: 15
+
+# ---------- Circuit Breaker ----------
+circuit_breaker:
+  daily_loss_pct: 0.15       # -15% / 24h → 24h停止
+  daily_halt_hours: 24
+  weekly_loss_pct: 0.25      # -25% / 7d  → 48h停止
+  weekly_halt_hours: 48
+  max_api_errors: 5          # 連続 API エラー上限
+
+# ---------- Notification ----------
+notification:
+  enabled: true
+  discord_webhook_url: ""    # 環境変数 DISCORD_WEBHOOK_URL で上書き
+
+# ---------- Persistence ----------
+persistence:
+  state_file: data/position_state.json
+  candles_dir: data/candles
+  log_dir: logs
+
+# ---------- Backtest ----------
+backtest:
+  data_dir: data/candles
+  initial_equity: 100000.0    # USDC
+  start_date: "2023-03-13"
+  end_date: "2025-12-31"
+  walkforward: false          # true: walk-forward分析を実行

@@ -1,9 +1,9 @@
-version: "3.9"
-
 services:
   trader:
-    image: trading-bot:cuda
-    container_name: trading-bot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vc_trader
     runtime: nvidia
     deploy:
       resources:
@@ -17,7 +17,16 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
     volumes:
+      - .:/app
       - ./data:/app/data
       - ./logs:/app/logs
 
-    command: python3 -m trade.main
+    working_dir: /app
+    
+    # 開発環境用: コンテナを起動し続ける
+    command: sleep infinity
+    
+    # 必要に応じてポートを公開
+    # ports:
+    #   - "8888:8888"  # Jupyter
+    #   - "6006:6006"  # TensorBoard

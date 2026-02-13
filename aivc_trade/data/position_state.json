@@ -1,0 +1,8 @@
+{
+  "position": null,
+  "last_signal_ts": null,
+  "last_process_ts": "2026-02-12T13:33:39.413303+00:00",
+  "equity_snapshots": [],
+  "halt_until": null,
+  "consecutive_api_errors": 120
+}

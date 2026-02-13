@@ -10,7 +10,7 @@ WORKDIR /app
 
 # ---- OS / Python ----
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip python3-venv git \
+    python3 python3-pip python3-venv git curl vim \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
@@ -22,4 +22,4 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip \
 
 COPY . /app
 
-CMD ["python3", "-m", "trade.main"]
+CMD ["python3", "-m", "aivc_trade.main_live"]
