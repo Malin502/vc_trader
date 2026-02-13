@@ -8,6 +8,10 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
+try:
+    from binance.client import Client as BinanceSDKClient
+except Exception:  # pragma: no cover - fallback when package is unavailable
+    BinanceSDKClient = None
 
 from aivc_trade.core.logger import get_logger
 
@@ -26,6 +30,12 @@ _INTERVAL_MS = {
 }
 
 
+def _binance_dt_str(dt: datetime) -> str:
+    """Convert datetime to Binance-compatible UTC datetime string."""
+    dt_utc = dt.astimezone(timezone.utc)
+    return dt_utc.strftime("%d %b, %Y %H:%M:%S UTC")
+
+
 class BinanceClient:
     """Thin wrapper around Binance public + authenticated REST endpoints."""
 
@@ -39,8 +49,16 @@ class BinanceClient:
         self.api_secret = api_secret
         self.base_url = base_url
         self._session = requests.Session()
+        self._session.timeout = 20  # type: ignore[attr-defined]
         if api_key:
             self._session.headers.update({"X-MBX-APIKEY": api_key})
+        self._public_client = None
+        if BinanceSDKClient is not None:
+            self._public_client = BinanceSDKClient(
+                api_key=api_key or None,
+                api_secret=api_secret or None,
+                requests_params={"timeout": 20},
+            )
 
     # ------------------------------------------------------------------
     # Public: Klines
@@ -64,6 +82,10 @@ class BinanceClient:
         if end_ms is not None:
             params["endTime"] = end_ms
 
+        if self._public_client is not None:
+            raw = self._public_client.get_klines(**params)
+            return self._parse_klines(raw)
+
         resp = self._session.get(f"{self.base_url}/api/v3/klines", params=params)
         resp.raise_for_status()
         raw: List[list] = resp.json()
@@ -80,6 +102,26 @@ class BinanceClient:
         start_ms = int(start_dt.timestamp() * 1000)
         end_ms = int(end_dt.timestamp() * 1000)
         limit = 1000
+
+        if self._public_client is not None:
+            raw = self._public_client.get_historical_klines(
+                symbol=symbol,
+                interval=interval,
+                start_str=_binance_dt_str(start_dt),
+                end_str=_binance_dt_str(end_dt),
+            )
+            sdk_df = self._parse_klines(raw)
+            interval_ms = _INTERVAL_MS.get(interval, 3_600_000)
+            expected_bars = max(1, ((end_ms - start_ms) // interval_ms) + 1)
+            if not (expected_bars > limit and len(sdk_df) <= limit):
+                sdk_df = sdk_df.drop_duplicates(subset=["ts"]).sort_values("ts")
+                sdk_df = sdk_df[(sdk_df["ts"] >= start_dt) & (sdk_df["ts"] <= end_dt)]
+                return sdk_df.reset_index(drop=True)
+            log.warning(
+                f"get_historical_klines returned only {len(sdk_df)} rows for {symbol} {interval}; "
+                "falling back to paginated /api/v3/klines fetch."
+            )
+
         all_frames: List[pd.DataFrame] = []
         cursor = start_ms
 
@@ -96,10 +138,11 @@ class BinanceClient:
 
         if not all_frames:
             return pd.DataFrame()
-        result = pd.concat(all_frames, ignore_index=True).drop_duplicates(
-            subset=["ts"]
-        )
-        return result.sort_values("ts").reset_index(drop=True)
+        result = pd.concat(all_frames, ignore_index=True)
+
+        result = result.drop_duplicates(subset=["ts"]).sort_values("ts")
+        result = result[(result["ts"] >= start_dt) & (result["ts"] <= end_dt)]
+        return result.reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Public: Exchange info (lot size filters)

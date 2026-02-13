@@ -109,6 +109,7 @@ class Signal:
     score: float = 0.0
     stop_price: float = 0.0
     entry_price: float = 0.0
+    ml_score: float = 0.0  # PhaseB: LightGBM entry probability
 
 
 @dataclass

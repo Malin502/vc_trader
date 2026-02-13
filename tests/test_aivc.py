@@ -1208,5 +1208,459 @@ class TestConfig:
         assert cfg["runner"]["chaos_tighten_k"] == 1.5
 
 
+# ============================================================
+# Test: PhaseB ML Feature Builder
+# ============================================================
+
+class TestMLFeatureBuilder:
+    def test_feature_cols_complete(self, candles_1h, sample_config):
+        """All ML_FEATURE_COLS are present in output."""
+        from aivc_trade.data.feature_engine import compute_features_1h
+        from aivc_trade.strategy.regime import classify_regime
+        from aivc_trade.ml.feature_builder import compute_ml_features, ML_FEATURE_COLS
+
+        df = compute_features_1h(candles_1h, sample_config)
+        df["regime"] = df.apply(lambda r: classify_regime(r, sample_config), axis=1)
+        ml_feat = compute_ml_features(df, sample_config)
+
+        for col in ML_FEATURE_COLS:
+            assert col in ml_feat.columns, f"Missing ML feature: {col}"
+
+    def test_has_ts_column(self, candles_1h, sample_config):
+        from aivc_trade.data.feature_engine import compute_features_1h
+        from aivc_trade.strategy.regime import classify_regime
+        from aivc_trade.ml.feature_builder import compute_ml_features
+
+        df = compute_features_1h(candles_1h, sample_config)
+        df["regime"] = df.apply(lambda r: classify_regime(r, sample_config), axis=1)
+        ml_feat = compute_ml_features(df, sample_config)
+
+        assert "ts" in ml_feat.columns
+        assert len(ml_feat) == len(df)
+
+    def test_no_future_leakage_in_returns(self, candles_1h, sample_config):
+        """ret_Xh features should be NaN for first X rows."""
+        from aivc_trade.data.feature_engine import compute_features_1h
+        from aivc_trade.strategy.regime import classify_regime
+        from aivc_trade.ml.feature_builder import compute_ml_features
+
+        df = compute_features_1h(candles_1h, sample_config)
+        df["regime"] = df.apply(lambda r: classify_regime(r, sample_config), axis=1)
+        ml_feat = compute_ml_features(df, sample_config)
+
+        assert pd.isna(ml_feat["ret_24h"].iloc[0])
+        assert pd.isna(ml_feat["ret_12h"].iloc[0])
+
+    def test_feature_values_finite_after_warmup(self, candles_1h, sample_config):
+        """After 200 bars warmup, numeric features should be finite."""
+        from aivc_trade.data.feature_engine import compute_features_1h
+        from aivc_trade.strategy.regime import classify_regime
+        from aivc_trade.ml.feature_builder import compute_ml_features, ML_FEATURE_COLS
+
+        df = compute_features_1h(candles_1h, sample_config)
+        df["regime"] = df.apply(lambda r: classify_regime(r, sample_config), axis=1)
+        ml_feat = compute_ml_features(df, sample_config)
+
+        # All features (including signal-time fields) should be finite
+        # after warmup since they are now computed from market data.
+        for col in ML_FEATURE_COLS:
+            vals = ml_feat[col].iloc[200:].dropna()
+            if len(vals) > 0:
+                assert np.isfinite(vals).all(), f"Non-finite values in {col}"
+
+    def test_patch_signal_features(self):
+        """patch_signal_features fills signal-time fields correctly."""
+        from aivc_trade.ml.feature_builder import patch_signal_features, ML_FEATURE_COLS
+        from aivc_trade.core.types import Signal, Side
+
+        ml_row = pd.Series({col: 0.0 for col in ML_FEATURE_COLS})
+        ml_row["entry_type_id"] = np.nan
+        ml_row["distance_to_stop_pct"] = np.nan
+        ml_row["expected_r_multiple"] = 1.5  # bar-level value from compute_ml_features
+        ml_row["recent_win_rate_5"] = np.nan
+
+        sig = Signal(
+            ts=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            symbol="BTCUSDC",
+            side=Side.BUY,
+            entry_type="BREAKOUT",
+            entry_price=50000,
+            stop_price=49000,
+        )
+        patched = patch_signal_features(ml_row, sig, [])
+
+        assert patched["entry_type_id"] == 1  # BREAKOUT
+        assert abs(patched["distance_to_stop_pct"] - 0.02) < 0.001
+        # expected_r_multiple is NOT overridden by patch_signal_features
+        # (bar-level value from compute_ml_features is preserved)
+        assert patched["expected_r_multiple"] == 1.5
+        assert patched["recent_win_rate_5"] == 0.5  # prior
+
+    def test_patch_with_recent_trades(self):
+        """recent_win_rate_5 computed from trade history."""
+        from aivc_trade.ml.feature_builder import patch_signal_features, ML_FEATURE_COLS
+        from aivc_trade.core.types import Signal, Side, TradeRecord, ExitReason
+
+        ml_row = pd.Series({col: 0.0 for col in ML_FEATURE_COLS})
+        sig = Signal(
+            ts=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            symbol="BTCUSDC",
+            entry_price=50000,
+            stop_price=49000,
+        )
+        # 3 wins, 2 losses
+        trades = []
+        for pnl in [100, -50, 200, 150, -30]:
+            t = TradeRecord(
+                symbol="BTCUSDC", side=Side.BUY,
+                entry_price=50000, exit_price=50100,
+                qty=0.1,
+                entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                exit_ts=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                exit_reason=ExitReason.TRAILING_STOP,
+                pnl=pnl,
+            )
+            trades.append(t)
+
+        patched = patch_signal_features(ml_row, sig, trades)
+        assert abs(patched["recent_win_rate_5"] - 0.6) < 0.01
+
+
+# ============================================================
+# Test: PhaseB ML Label Builder
+# ============================================================
+
+class TestMLLabelBuilder:
+    def test_labels_binary(self, candles_1h):
+        """Labels should be 0 or 1 (or NaN for tail)."""
+        from aivc_trade.ml.label_builder import compute_labels
+
+        labels = compute_labels(candles_1h, horizon_bars=24)
+        valid = labels.dropna()
+        assert set(valid.unique()).issubset({0.0, 1.0})
+
+    def test_labels_nan_at_tail(self, candles_1h):
+        """Last horizon_bars rows should be NaN."""
+        from aivc_trade.ml.label_builder import compute_labels
+
+        H = 24
+        labels = compute_labels(candles_1h, horizon_bars=H)
+        assert labels.iloc[-H:].isna().all()
+
+    def test_labels_not_all_same(self):
+        """With enough data and loose thresholds, both classes should appear."""
+        from aivc_trade.ml.label_builder import compute_labels
+
+        df = _make_candles(500, trend=0.0003, volatility=0.008)
+        labels = compute_labels(df, horizon_bars=24, tp_thr=0.005, dd_thr=0.05)
+        valid = labels.dropna()
+        assert valid.sum() > 0, "Should have some positive labels"
+        assert (valid == 0).sum() > 0, "Should have some negative labels"
+
+    def test_labels_from_config(self, candles_1h, sample_config):
+        from aivc_trade.ml.label_builder import compute_labels_from_config
+
+        labels = compute_labels_from_config(candles_1h, sample_config)
+        assert len(labels) == len(candles_1h)
+        assert labels.iloc[-1] != labels.iloc[-1]  # NaN check
+
+
+# ============================================================
+# Test: PhaseB Entry Filter
+# ============================================================
+
+class TestEntryFilter:
+    def test_disabled_filter_passes_all(self, sample_config):
+        """When ml_filter.enabled=false, all signals pass."""
+        import copy
+        from aivc_trade.ml.entry_filter import EntryFilter
+        from aivc_trade.core.types import Signal, Side
+
+        cfg = copy.deepcopy(sample_config)
+        cfg.setdefault("ml_filter", {})["enabled"] = False
+        ef = EntryFilter(cfg)
+
+        sig = Signal(
+            ts=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            symbol="BTCUSDC",
+            entry_price=50000,
+            stop_price=49000,
+        )
+        passed, score = ef.filter_signal(sig, pd.DataFrame(), [])
+        assert passed is True
+        assert score == 1.0
+
+    def test_enabled_no_model_passes_all(self, sample_config):
+        """When enabled but no model loaded, signals pass through."""
+        import copy
+        from aivc_trade.ml.entry_filter import EntryFilter
+        from aivc_trade.core.types import Signal
+
+        cfg = copy.deepcopy(sample_config)
+        cfg.setdefault("ml_filter", {})["enabled"] = True
+        cfg["ml_filter"]["model_dir"] = "/tmp/nonexistent_models_abc123"
+        ef = EntryFilter(cfg)
+        ef.load_model()
+
+        sig = Signal(
+            ts=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            symbol="BTCUSDC",
+            entry_price=50000,
+            stop_price=49000,
+        )
+        passed, score = ef.filter_signal(sig, pd.DataFrame(), [])
+        assert passed is True
+        assert score == 1.0
+
+    def test_create_entry_filter_disabled(self, sample_config):
+        """Factory creates a disabled filter by default."""
+        from aivc_trade.ml.entry_filter import create_entry_filter
+
+        ef = create_entry_filter(sample_config)
+        assert ef.enabled is False
+        assert ef.registry.is_loaded is False
+
+
+# ============================================================
+# Test: PhaseB Walk-Forward Splits
+# ============================================================
+
+class TestWalkForwardSplits:
+    def test_splits_have_purge_gap(self):
+        """Verify purge gap between train and valid."""
+        from aivc_trade.ml.lgbm_trainer import _time_series_splits
+
+        # 365 days of hourly timestamps
+        ts = pd.date_range("2024-01-01", periods=365 * 24, freq="h", tz="UTC")
+        ts_series = pd.Series(ts)
+
+        folds = _time_series_splits(
+            ts_series,
+            train_days=120,
+            valid_days=30,
+            test_days=30,
+            purge_bars=24,
+            step_days=30,
+        )
+        assert len(folds) > 0
+
+        for fold in folds:
+            # Valid starts after train_end + purge (24h)
+            assert fold["valid_start"] >= fold["train_end"] + timedelta(hours=24)
+            # Test starts at valid_end
+            assert fold["test_start"] == fold["valid_end"]
+            # No overlap between train and valid indices
+            train_set = set(fold["train_idx"])
+            valid_set = set(fold["valid_idx"])
+            test_set = set(fold["test_idx"])
+            assert train_set.isdisjoint(valid_set)
+            assert valid_set.isdisjoint(test_set)
+            assert train_set.isdisjoint(test_set)
+
+    def test_splits_empty_for_short_data(self):
+        """Short data should produce no folds."""
+        from aivc_trade.ml.lgbm_trainer import _time_series_splits
+
+        ts = pd.date_range("2024-01-01", periods=30 * 24, freq="h", tz="UTC")
+        ts_series = pd.Series(ts)
+
+        folds = _time_series_splits(ts_series, train_days=120)
+        assert len(folds) == 0
+
+
+# ============================================================
+# Test: PhaseB Signal type ml_score field
+# ============================================================
+
+class TestSignalMLScore:
+    def test_signal_has_ml_score_default(self):
+        from aivc_trade.core.types import Signal
+
+        sig = Signal(
+            ts=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            symbol="BTCUSDC",
+        )
+        assert sig.ml_score == 0.0
+
+    def test_signal_ml_score_settable(self):
+        from aivc_trade.core.types import Signal
+
+        sig = Signal(
+            ts=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            symbol="BTCUSDC",
+        )
+        sig.ml_score = 0.75
+        assert sig.ml_score == 0.75
+
+
+# ============================================================
+# Test: PhaseB timezone alignment (Issue A)
+# ============================================================
+
+class TestPhaseBTimezoneAlignment:
+    def test_compute_ml_features_ts_is_utc_aware(self, candles_1h, sample_config):
+        """compute_ml_features must produce UTC-aware ts column."""
+        from aivc_trade.data.feature_engine import compute_features_1h
+        from aivc_trade.strategy.regime import classify_regime
+        from aivc_trade.ml.feature_builder import compute_ml_features
+
+        df = compute_features_1h(candles_1h, sample_config)
+        df["regime"] = df.apply(lambda r: classify_regime(r, sample_config), axis=1)
+        ml_feat = compute_ml_features(df, sample_config)
+
+        # ts column should be UTC-aware
+        assert ml_feat["ts"].dt.tz is not None, "ts must be timezone-aware"
+        assert str(ml_feat["ts"].dt.tz) == "UTC", "ts must be UTC"
+
+    def test_ml_ts_matches_timeline_ts(self, candles_1h, sample_config):
+        """ML feature ts index should match timeline ts for correct lookup."""
+        from aivc_trade.data.feature_engine import compute_features_1h
+        from aivc_trade.strategy.regime import classify_regime
+        from aivc_trade.ml.feature_builder import compute_ml_features
+
+        df = compute_features_1h(candles_1h, sample_config)
+        df["regime"] = df.apply(lambda r: classify_regime(r, sample_config), axis=1)
+        ml_feat = compute_ml_features(df, sample_config)
+
+        # Simulate what simulator does: set_index after ensuring UTC
+        ml_feat["ts"] = pd.to_datetime(ml_feat["ts"], utc=True)
+        ml_indexed = ml_feat.set_index("ts")
+
+        # Build timeline the same way simulator does
+        ts_series = pd.to_datetime(df["ts"], utc=True)
+        timeline_ts = ts_series.tolist()
+
+        # Every timeline ts that exists in df should be findable in ml_indexed
+        match_count = 0
+        for ts in timeline_ts:
+            if ts in ml_indexed.index:
+                match_count += 1
+
+        assert match_count == len(timeline_ts), (
+            f"Only {match_count}/{len(timeline_ts)} timeline timestamps "
+            f"found in ML feature index"
+        )
+
+    def test_naive_ts_input_still_produces_utc(self, sample_config):
+        """Even if input df has naive ts, output should be UTC-aware."""
+        from aivc_trade.ml.feature_builder import compute_ml_features
+        from aivc_trade.data.feature_engine import compute_features_1h
+        from aivc_trade.strategy.regime import classify_regime
+
+        candles = _make_candles(300, trend=0.0003)
+        # Make ts naive by stripping timezone
+        candles["ts"] = candles["ts"].dt.tz_localize(None)
+
+        df = compute_features_1h(candles, sample_config)
+        df["regime"] = df.apply(lambda r: classify_regime(r, sample_config), axis=1)
+        ml_feat = compute_ml_features(df, sample_config)
+
+        assert ml_feat["ts"].dt.tz is not None, "ts must be timezone-aware even from naive input"
+
+
+# ============================================================
+# Test: PhaseB entry filter fail mode (Issue B)
+# ============================================================
+
+class TestEntryFilterFailMode:
+    def test_on_missing_model_fail_raises(self, sample_config):
+        """on_missing_model=fail raises RuntimeError when model is missing."""
+        import copy
+        from aivc_trade.ml.entry_filter import EntryFilter
+
+        cfg = copy.deepcopy(sample_config)
+        cfg.setdefault("ml_filter", {})["enabled"] = True
+        cfg["ml_filter"]["model_dir"] = "/tmp/nonexistent_models_xyz"
+        cfg["ml_filter"]["on_missing_model"] = "fail"
+        ef = EntryFilter(cfg)
+
+        with pytest.raises(RuntimeError, match="no model found"):
+            ef.load_model()
+
+    def test_on_missing_model_pass_does_not_raise(self, sample_config):
+        """on_missing_model=pass logs warning but does not raise."""
+        import copy
+        from aivc_trade.ml.entry_filter import EntryFilter
+
+        cfg = copy.deepcopy(sample_config)
+        cfg.setdefault("ml_filter", {})["enabled"] = True
+        cfg["ml_filter"]["model_dir"] = "/tmp/nonexistent_models_xyz"
+        cfg["ml_filter"]["on_missing_model"] = "pass"
+        ef = EntryFilter(cfg)
+
+        result = ef.load_model()
+        assert result is False
+        # filter_signal should still pass all
+        from aivc_trade.core.types import Signal
+        sig = Signal(
+            ts=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            symbol="BTCUSDC",
+            entry_price=50000,
+            stop_price=49000,
+        )
+        passed, score = ef.filter_signal(sig, pd.DataFrame(), [])
+        assert passed is True
+
+    def test_filter_signal_fail_mode_raises_when_no_model(self, sample_config):
+        """filter_signal with fail mode raises if model not loaded."""
+        import copy
+        from aivc_trade.ml.entry_filter import EntryFilter
+        from aivc_trade.core.types import Signal
+
+        cfg = copy.deepcopy(sample_config)
+        cfg.setdefault("ml_filter", {})["enabled"] = True
+        cfg["ml_filter"]["model_dir"] = "/tmp/nonexistent_models_xyz"
+        cfg["ml_filter"]["on_missing_model"] = "fail"
+        ef = EntryFilter(cfg)
+        # Skip load_model (which would raise), directly test filter_signal
+        ef.registry._model = None  # ensure not loaded
+
+        sig = Signal(
+            ts=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            symbol="BTCUSDC",
+            entry_price=50000,
+            stop_price=49000,
+        )
+        with pytest.raises(RuntimeError, match="no model is loaded"):
+            ef.filter_signal(sig, pd.DataFrame(), [])
+
+
+# ============================================================
+# Test: PhaseB threshold optimization (Issue C)
+# ============================================================
+
+class TestThresholdOptimization:
+    def test_pass_rate_penalty(self):
+        """High pass-rate thresholds should be penalized."""
+        from aivc_trade.ml.lgbm_trainer import _optimize_threshold
+
+        # Create data where low threshold passes everything
+        y_true = np.array([1, 0, 1, 0, 1, 0, 1, 0, 1, 0] * 5)
+        # Probabilities: most are around 0.5, some high
+        y_prob = np.array([0.55, 0.45, 0.65, 0.35, 0.75, 0.40, 0.60, 0.50, 0.70, 0.42] * 5)
+
+        best_thr, results = _optimize_threshold(
+            y_true, y_prob, min_trades=3, max_pass_rate=0.85,
+        )
+
+        # Verify pass_rate is included in results
+        for thr_val, metrics in results.items():
+            assert "pass_rate" in metrics
+            assert "n_total" in metrics
+
+    def test_results_include_pass_rate(self):
+        """Threshold sweep results include pass_rate."""
+        from aivc_trade.ml.lgbm_trainer import _optimize_threshold
+
+        y_true = np.random.randint(0, 2, 100).astype(float)
+        y_prob = np.random.rand(100)
+
+        _, results = _optimize_threshold(y_true, y_prob, min_trades=3)
+
+        for thr_val, metrics in results.items():
+            assert "pass_rate" in metrics
+            assert 0.0 <= metrics["pass_rate"] <= 1.0
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

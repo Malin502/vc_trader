@@ -16,7 +16,7 @@ timeframes:
 
 position:
   max_concurrent: 2          # 同時保有最大数
-  cooldown_hours: 24         # 決済後の再エントリ禁止(h) ※後方互換用
+  cooldown_hours: 48         # 決済後の再エントリ禁止(h) ※後方互換用
   stop_loss_cooldown_hours: 48
   regime_exit_cooldown_hours: 24
 
@@ -68,14 +68,14 @@ regime:
 entry:
   ret24h_min_pct: 2.0          # 直近24hリターン条件を緩和（攻撃寄り）
   atr_pct_min: 1.0             # 旧ゲート（後方互換）
-  cooldown_bars: 24            # 決済後のクールダウン (bars, 24h)
+  cooldown_bars: 48            # 決済後のクールダウン (bars)
   trigger: breakout            # pullback | breakout | both
   pullback_threshold: 0.015    # |close - ema_fast|/close <= 1.5%
   volume_above_sma: true
 
 entry_filter:
   enabled: true
-  adx_min: 22
+  adx_min: 20
   trend_ma_type: ema
   trend_ma_period: 200
   atr_pct_min: 0.25            # 0.25%未満の低ボラは除外
@@ -116,7 +116,6 @@ risk:
   breakeven:
     enabled: true
     activate_mfe_pct: 0.8
-    buffer_pct: 0.05
 
 # ---------- Exit Conditions ----------
 exit:
@@ -129,16 +128,16 @@ exit:
 # ---------- Partial Take-Profit / Runner Mode ----------
 partial_tp:
   enabled: true
-  threshold_pct: 4.2           # 早利確を抑えてランナー化を優先
-  ratio: 0.20                  # 利確割合を下げて伸ばす
+  threshold_pct: 4.5
+  ratio: 0.30                  # 30%部分利確
   max_count: 1                 # 最大1回
 
 runner:
-  trail_atr_k: 3.8             # ランナーをやや緩く保持
-  trail_activate_mfe_pct: 4.5  # ランナートレール有効化MFE閾値 (%)
+  trail_atr_k: 3.8
+  trail_activate_mfe_pct: 4.5
   trail_start_mfe_pct: 2.0     # 旧キー（後方互換）
   stop_buffer_pct: 0.0         # stopノイズバッファ (%)
-  range_exit_confirm_bars: 10  # RANGE連続N本 + 条件でExit (was 3/6)
+  range_exit_confirm_bars: 16  # RANGE連続N本 + 条件でExit (was 3/6)
   max_off_bars: 18             # 非TREND_UP最大猶予バー数
   min_mfe_to_hold_pct: 1.5     # 保持継続の最小MFE (%)
   chaos_tighten_k: 1.5         # CHAOS時のstopタイト化 ATR乗数
@@ -163,8 +162,8 @@ exit_tuning:
 
 # ---------- Position Sizing ----------
 sizing:
-  risk_per_trade: 0.08       # 口座資産の 8%（高リスク高リターン）
-  max_notional_pct: 1.00     # 最大投下比率
+  risk_per_trade: 0.05
+  max_notional_pct: 0.95
 
 # ---------- Symbol Score Weights ----------
 score:
@@ -200,6 +199,40 @@ persistence:
 backtest:
   data_dir: data/candles
   initial_equity: 100000.0    # USDC
-  start_date: "2023-03-13"
-  end_date: "2025-12-31"
+  start_date: "2025-09-01"
+  end_date: "2026-2-13"
   walkforward: false          # true: walk-forward分析を実行
+  offline: false              # true: ネットワークアクセス禁止（キャッシュのみ使用）
+
+# ---------- PhaseB ML Entry Filter ----------
+ml_filter:
+  enabled: false
+  model_dir: data/models
+  threshold: 0.55                   # Fallback if model meta lacks threshold
+  on_missing_model: fail            # pass: 全通過で継続, fail: エラーで停止
+  # Label definition
+  label_horizon_bars: 24            # H=24h lookahead
+  label_tp_thr: 0.015              # +1.5% take-profit threshold
+  label_dd_thr: 0.010              # -1.0% max drawdown threshold
+  # Walk-forward splits
+  train_days: 270
+  valid_days: 60
+  test_days: 60
+  purge_bars: 24                    # Gap in bars between train/valid
+  step_days: 60
+  min_trades_for_threshold: 50      # Min trades to consider a threshold
+  # LightGBM hyperparameters
+  num_boost_round: 1200
+  early_stopping_rounds: 200
+  lgb_params:
+    metric: auc
+    learning_rate: 0.01
+    num_leaves: 15
+    max_depth: 4
+    min_child_samples: 80
+    feature_fraction: 0.90
+    bagging_fraction: 0.90
+    bagging_freq: 1
+    lambda_l1: 0.4
+    lambda_l2: 1.0
+    min_gain_to_split: 0.0

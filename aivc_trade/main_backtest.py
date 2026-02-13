@@ -32,9 +32,16 @@ log = get_logger("main_backtest")
 def _ensure_data(
     cfg: Dict[str, Any],
     store: CandlesStore,
-    client: BinanceClient,
+    client: Any,
+    offline: bool = False,
 ) -> tuple[Dict[str, pd.DataFrame], Dict[str, pd.DataFrame]]:
-    """Load or download candle data for the backtest period."""
+    """Load or download candle data for the backtest period.
+
+    Parameters
+    ----------
+    client : BinanceClient or None (when offline=True)
+    offline : if True, only use cached data, never hit the network.
+    """
     start = datetime.strptime(cfg["backtest"]["start_date"], "%Y-%m-%d").replace(
         tzinfo=timezone.utc
     )
@@ -56,18 +63,25 @@ def _ensure_data(
                 candles_1h[sym] = cached[
                     (cached["ts"] >= start) & (cached["ts"] <= end)
                 ].reset_index(drop=True)
-            else:
+            elif not offline:
                 log.info(f"Downloading 1h data for {sym}...")
                 df = client.fetch_klines_full(sym, "1h", start, end)
                 if not df.empty:
                     store.save(sym, "1h", df)
                     candles_1h[sym] = df
-        else:
+            else:
+                log.warning(
+                    f"Offline mode: cached 1h data for {sym} does not cover "
+                    f"requested period ({min_ts.date()}..{max_ts.date()}), skipping"
+                )
+        elif not offline:
             log.info(f"Downloading 1h data for {sym}...")
             df = client.fetch_klines_full(sym, "1h", start, end)
             if not df.empty:
                 store.save(sym, "1h", df)
                 candles_1h[sym] = df
+        else:
+            log.warning(f"Offline mode: no cached 1h data for {sym}, skipping")
 
         # 5m
         cached_5m = store.load(sym, "5m")
@@ -79,18 +93,25 @@ def _ensure_data(
                 candles_5m[sym] = cached_5m[
                     (cached_5m["ts"] >= start) & (cached_5m["ts"] <= end)
                 ].reset_index(drop=True)
-            else:
+            elif not offline:
                 log.info(f"Downloading 5m data for {sym}...")
                 df = client.fetch_klines_full(sym, "5m", start, end)
                 if not df.empty:
                     store.save(sym, "5m", df)
                     candles_5m[sym] = df
-        else:
+            else:
+                log.warning(
+                    f"Offline mode: cached 5m data for {sym} does not cover "
+                    f"requested period, skipping"
+                )
+        elif not offline:
             log.info(f"Downloading 5m data for {sym}...")
             df = client.fetch_klines_full(sym, "5m", start, end)
             if not df.empty:
                 store.save(sym, "5m", df)
                 candles_5m[sym] = df
+        else:
+            log.warning(f"Offline mode: no cached 5m data for {sym}, skipping")
 
     return candles_1h, candles_5m
 
@@ -169,10 +190,16 @@ def main() -> None:
     log.info(f"Initial equity: {cfg['backtest']['initial_equity']}")
     log.info("=" * 50)
 
-    client = BinanceClient()  # public endpoints only
-    store = CandlesStore(cfg["persistence"]["candles_dir"])
+    offline = bool(cfg["backtest"].get("offline", False))
+    client = None
+    if not offline:
+        client = BinanceClient()  # public endpoints only
+    else:
+        log.info("Offline mode: skipping Binance client initialization")
+    store = CandlesStore("data/candles/test")
+    log.info("Using candles dir for backtest: data/candles/test")
 
-    candles_1h, candles_5m = _ensure_data(cfg, store, client)
+    candles_1h, candles_5m = _ensure_data(cfg, store, client, offline=offline)
 
     if not candles_1h:
         log.error("No 1h candle data available – aborting")

@@ -13,6 +13,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 
 from aivc_trade.core.types import (
@@ -28,6 +29,8 @@ from aivc_trade.strategy.regime import classify_regime, apply_regime_hysteresis
 from aivc_trade.strategy.signal import generate_signals
 from aivc_trade.strategy.sizing import compute_qty
 from aivc_trade.execution.position_manager import PositionManager
+from aivc_trade.ml.entry_filter import create_entry_filter
+from aivc_trade.ml.feature_builder import ML_FEATURE_COLS, patch_signal_features
 
 log = get_logger("simulator")
 
@@ -58,6 +61,8 @@ class Simulator:
             cfg["position"].get("regime_exit_cooldown_hours",
                                 cfg["position"].get("cooldown_hours", 6))
         )
+        # PhaseB ML entry filter
+        self.entry_filter = create_entry_filter(cfg)
 
     def run(
         self,
@@ -91,10 +96,20 @@ class Simulator:
             raw_regimes = df.apply(lambda row: classify_regime(row, self.cfg), axis=1)
             df["regime"] = apply_regime_hysteresis(raw_regimes, confirm_bars)
 
-        # --- Build unified 1h timeline ---
+        # --- PhaseB: precompute ML features indexed by (symbol, ts) ---
+        ml_feat_indexed: Dict[str, pd.DataFrame] = {}
+        if self.entry_filter.enabled and self.entry_filter.registry.is_loaded:
+            from aivc_trade.ml.feature_builder import compute_ml_features
+            for sym in feat_1h:
+                ml_feat = compute_ml_features(feat_1h[sym], self.cfg)
+                ml_feat["ts"] = pd.to_datetime(ml_feat["ts"], utc=True)
+                ml_feat_indexed[sym] = ml_feat.set_index("ts")
+
+        # --- Build unified 1h timeline (ensure UTC aware) ---
         all_ts = set()
         for df in feat_1h.values():
-            all_ts.update(df["ts"].tolist())
+            ts_series = pd.to_datetime(df["ts"], utc=True)
+            all_ts.update(ts_series.tolist())
         timeline = sorted(all_ts)
 
         if not timeline:
@@ -109,6 +124,15 @@ class Simulator:
         trades: List[TradeRecord] = []
         equity_records: List[Dict[str, Any]] = []
         entry_bar_idx: int = 0  # bar index when position was entered
+
+        # --- PhaseB debug counters ---
+        ml_stats = {
+            "signals_total": 0,
+            "signals_scored_by_ml": 0,
+            "signals_missing_ml_ts": 0,
+            "signals_passed_ml": 0,
+            "signals_blocked_ml": 0,
+        }
 
         # Pre-index 5m data for quick lookup
         _5m_idx = {}
@@ -281,6 +305,41 @@ class Simulator:
                     cooldowns_bar=cooldowns_bar,
                     current_bar_idx=i,
                 )
+                # --- PhaseB: filter signals through ML model ---
+                if signals:
+                    ml_stats["signals_total"] += len(signals)
+                if signals and ml_feat_indexed:
+                    filtered_signals = []
+                    for sig in signals:
+                        ml_df = ml_feat_indexed.get(sig.symbol)
+                        if ml_df is None or ts not in ml_df.index:
+                            ml_stats["signals_missing_ml_ts"] += 1
+                            filtered_signals.append(sig)
+                            continue
+                        ml_stats["signals_scored_by_ml"] += 1
+                        ml_row = patch_signal_features(
+                            ml_df.loc[ts], sig, trades,
+                        )
+                        fv = ml_row[ML_FEATURE_COLS].values.astype(np.float64)
+                        fv = np.nan_to_num(fv, nan=0.0)
+                        prob = float(
+                            self.entry_filter.registry.model.predict(
+                                fv.reshape(1, -1)
+                            )[0]
+                        )
+                        if prob >= self.entry_filter.registry.threshold:
+                            sig.ml_score = prob
+                            ml_stats["signals_passed_ml"] += 1
+                            filtered_signals.append(sig)
+                        else:
+                            ml_stats["signals_blocked_ml"] += 1
+                            log.debug(
+                                f"PhaseB SKIP: {sig.symbol} "
+                                f"score={prob:.4f} < "
+                                f"{self.entry_filter.registry.threshold:.3f}"
+                            )
+                    signals = filtered_signals
+
                 if signals:
                     best = signals[0]
                     # Entry at next bar open
@@ -369,6 +428,20 @@ class Simulator:
             f"Backtest done: {len(trades)} trades, "
             f"final equity={equity:.2f}"
         )
+        if ml_feat_indexed:
+            log.info(
+                f"PhaseB ML summary: "
+                f"signals_total={ml_stats['signals_total']} "
+                f"scored_by_ml={ml_stats['signals_scored_by_ml']} "
+                f"missing_ml_ts={ml_stats['signals_missing_ml_ts']} "
+                f"passed_ml={ml_stats['signals_passed_ml']} "
+                f"blocked_ml={ml_stats['signals_blocked_ml']}"
+            )
+            if ml_stats["signals_missing_ml_ts"] > 0:
+                log.warning(
+                    f"PhaseB: {ml_stats['signals_missing_ml_ts']} signals had no "
+                    f"matching ML timestamp — check timezone alignment"
+                )
         return trades, equity_df
 
     # ------------------------------------------------------------------

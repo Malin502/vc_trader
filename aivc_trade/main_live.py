@@ -36,6 +36,7 @@ from aivc_trade.execution.broker import LiveBroker
 from aivc_trade.ops.healthcheck import HealthCheck
 from aivc_trade.ops.notifier import DiscordNotifier
 from aivc_trade.ops.persistence import StateManager
+from aivc_trade.ml.entry_filter import create_entry_filter
 
 log = get_logger("main_live")
 
@@ -91,6 +92,7 @@ def main() -> None:
     hc = HealthCheck()
     notifier = DiscordNotifier(cfg["notification"]["discord_webhook_url"])
     state_mgr = StateManager(cfg["persistence"]["state_file"])
+    entry_filter = create_entry_filter(cfg)
 
     # --- Restore state ---
     state = state_mgr.load()
@@ -177,6 +179,13 @@ def main() -> None:
                     if cb.record_api_error():
                         notifier.notify_error(f"API error streak for {sym}: {e}")
                     continue
+
+            # --- PhaseB: refresh ML feature cache ---
+            if entry_filter.enabled:
+                entry_filter.clear_cache()
+                for sym, df in feat_1h.items():
+                    if not df.empty:
+                        entry_filter.compute_and_cache_ml_features(sym, df)
 
             # --- Regime classification ---
             for sym, df in feat_1h.items():
@@ -305,6 +314,25 @@ def main() -> None:
                     current_position=position,
                     cooldowns=cooldowns,
                 )
+                # --- PhaseB: filter signals through ML model ---
+                if signals and entry_filter.enabled:
+                    filtered_signals = []
+                    for sig in signals:
+                        passed, ml_score = entry_filter.filter_signal(
+                            sig,
+                            feat_1h.get(sig.symbol, pd.DataFrame()),
+                            [],
+                        )
+                        if passed:
+                            sig.ml_score = ml_score
+                            filtered_signals.append(sig)
+                        else:
+                            log.info(
+                                f"PhaseB SKIP: {sig.symbol} "
+                                f"score={ml_score:.4f}"
+                            )
+                    signals = filtered_signals
+
                 if signals:
                     best = signals[0]
                     li = lot_info.get(best.symbol, {})

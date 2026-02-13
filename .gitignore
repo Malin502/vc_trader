@@ -2,3 +2,4 @@
 features/*
 /datasets/*
 /artifacts/*
+*.env
