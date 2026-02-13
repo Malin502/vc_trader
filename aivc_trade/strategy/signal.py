@@ -1,9 +1,10 @@
-"""Signal generation – Pullback + Breakout entry logic."""
+"""Signal generation – Trend-focused entry logic (pullback OR breakout)."""
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
+import math
 import pandas as pd
 
 from aivc_trade.core.types import Position, Regime, Side, Signal
@@ -27,11 +28,9 @@ def _normalize(series: pd.Series) -> pd.Series:
 def compute_score(row: pd.Series, cfg: Dict[str, Any]) -> float:
     """Return entry score for a single feature row (higher is better)."""
     w = cfg["score"]
-    # Normalisation happens across both symbols in the caller,
-    # so here we just use raw values scaled by weight.
     return (
         w["w_slope"] * row["slope"]
-        + w["w_adx"] * row["adx"] / 100.0  # rough normalise
+        + w["w_adx"] * row["adx"] / 100.0
         + w["w_atrp_z"] * row["atrp_z"]
     )
 
@@ -41,34 +40,35 @@ def compute_score(row: pd.Series, cfg: Dict[str, Any]) -> float:
 # ============================================================
 
 def _check_pullback(row: pd.Series, cfg: Dict[str, Any]) -> bool:
-    """5.1 – close near ema_fast (pullback)."""
+    """Pullback trigger: price dipped to EMA_fast then recovered.
+
+    Design: low < ema_fast AND close > ema_fast
+    (price touched/crossed EMA_fast from below and closed above it)
+    """
     threshold = cfg["entry"]["pullback_threshold"]
     gap = abs(row["close"] - row["ema_fast"]) / row["close"]
-    return gap <= threshold
+    # Close is near or above EMA_fast after a dip
+    return gap <= threshold and row["close"] >= row["ema_fast"]
 
 
-def _check_breakout(row: pd.Series) -> bool:
-    """5.2 – close breaks previous donchian high."""
+def _check_breakout(row: pd.Series, cfg: Dict[str, Any]) -> bool:
+    """Breakout trigger with optional strict lookback+buffer rule."""
+    bcfg = cfg.get("entry_signal", {}).get("breakout", {})
+    if bcfg.get("enabled", False):
+        buffer_pct = float(bcfg.get("buffer_pct", 0.0))
+        rolling_high = row.get("breakout_high_prev")
+        if rolling_high is None or pd.isna(rolling_high):
+            rolling_high = row.get("donchian_high_prev")
+        if rolling_high is None or pd.isna(rolling_high):
+            return False
+        return float(row["close"]) > float(rolling_high) * (1 + buffer_pct / 100.0)
+
     return row["close"] > row["donchian_high_prev"]
 
 
 def _check_volume(row: pd.Series) -> bool:
-    """5.2 – volume above SMA."""
+    """Volume above SMA."""
     return row["volume"] > row["volume_sma"]
-
-
-def _check_5m_filter(df_5m: pd.DataFrame, cfg: Dict[str, Any]) -> bool:
-    """5.3 – execution filter on latest 5m bar."""
-    if df_5m.empty:
-        return False
-    row = df_5m.iloc[-1]
-    # micro trend
-    if row["ema_fast"] <= row["ema_slow"]:
-        return False
-    # micro vol not too high
-    if cfg["entry"]["micro_vol_filter"] and row["micro_vol"] > row["micro_vol_pct90"]:
-        return False
-    return True
 
 
 def _check_entry_quality(row: pd.Series, cfg: Dict[str, Any]) -> bool:
@@ -77,7 +77,13 @@ def _check_entry_quality(row: pd.Series, cfg: Dict[str, Any]) -> bool:
     if not qcfg.get("enabled", True):
         return True
 
-    if row.get("adx", 0.0) < qcfg.get("min_adx", 0.0):
+    min_adx = float(qcfg.get("min_adx", 0.0))
+    adx_strict_gt = bool(qcfg.get("adx_strict_gt", False))
+    adx_val = float(row.get("adx", 0.0))
+    if adx_strict_gt:
+        if adx_val <= min_adx:
+            return False
+    elif adx_val < min_adx:
         return False
     if row.get("atrp", 0.0) < qcfg.get("min_atrp", 0.0):
         return False
@@ -94,49 +100,103 @@ def _check_entry_quality(row: pd.Series, cfg: Dict[str, Any]) -> bool:
     return True
 
 
-def _check_pre_entry_return_cap(df_1h: pd.DataFrame, cfg: Dict[str, Any]) -> bool:
-    """Block late entries after an excessive short-term run-up."""
-    ecfg = cfg.get("entry", {})
-    max_ret_3h = ecfg.get("max_pre_entry_ret_3h")
-    max_ret_24h = ecfg.get("max_pre_entry_ret_24h")
+def _check_ret24h_minimum(row: pd.Series, cfg: Dict[str, Any]) -> bool:
+    """Require minimum 24h return (momentum filter).
 
-    if max_ret_3h is None and max_ret_24h is None:
+    Unlike the old max_pre_entry_ret_24h which BLOCKED entries above 3%,
+    this REQUIRES ret_24h >= ret24h_min_pct for entry.
+    """
+    ret24h_min = cfg["entry"].get("ret24h_min_pct")
+    if ret24h_min is None:
         return True
-    if len(df_1h) < 2:
+    ret_24h = row.get("ret_24h", None)
+    if ret_24h is None or pd.isna(ret_24h):
+        return False
+    return float(ret_24h) * 100.0 >= float(ret24h_min)
+
+
+def _check_atr_pct_min(row: pd.Series, cfg: Dict[str, Any]) -> bool:
+    """Filter out too-quiet markets."""
+    atr_pct_min = cfg["entry"].get("atr_pct_min")
+    if atr_pct_min is None:
+        return True
+    atrp = row.get("atrp", 0.0)
+    return float(atrp) * 100.0 >= float(atr_pct_min)
+
+
+def _check_entry_filter(row: pd.Series, cfg: Dict[str, Any]) -> bool:
+    """Trend/volatility entry gate (C1)."""
+    ef_cfg = cfg.get("entry_filter", {})
+    if not ef_cfg.get("enabled", False):
+        return True
+
+    adx_min = float(ef_cfg.get("adx_min", 0.0))
+    if float(row.get("adx", 0.0)) < adx_min:
         return False
 
-    close_now = float(df_1h.iloc[-1]["close"])
-
-    if max_ret_3h is not None:
-        lookback = 3
-        if len(df_1h) <= lookback:
-            return False
-        close_prev = float(df_1h.iloc[-1 - lookback]["close"])
-        ret_3h = (close_now / close_prev) - 1.0 if close_prev > 0 else 0.0
-        if ret_3h > float(max_ret_3h):
+    trend_ma = row.get("trend_ma", row.get("ema_slow", None))
+    if trend_ma is not None and not pd.isna(trend_ma):
+        if float(row.get("close", 0.0)) <= float(trend_ma):
             return False
 
-    if max_ret_24h is not None:
-        lookback = 24
-        if len(df_1h) <= lookback:
-            return False
-        close_prev = float(df_1h.iloc[-1 - lookback]["close"])
-        ret_24h = (close_now / close_prev) - 1.0 if close_prev > 0 else 0.0
-        if ret_24h > float(max_ret_24h):
+    atr_pct_min = float(ef_cfg.get("atr_pct_min", 0.0))
+    if float(row.get("atrp", 0.0)) * 100.0 < atr_pct_min:
+        return False
+
+    if ef_cfg.get("require_trend_regime", False):
+        if row.get("regime", Regime.RANGE) != Regime.TREND_UP:
             return False
 
     return True
 
 
-def _check_regime_hysteresis(df_1h: pd.DataFrame, cfg: Dict[str, Any]) -> bool:
-    """Require trend regime persistence before allowing re-entry."""
-    bars = int(cfg["entry"].get("regime_hysteresis_bars", 0))
-    if bars <= 1:
-        return True
-    if len(df_1h) < bars:
-        return False
-    last = df_1h.iloc[-bars:]
-    return bool((last["regime"] == Regime.TREND_UP).all())
+def compute_initial_stop_price(
+    entry_price: float,
+    atr_value: float,
+    cfg: Dict[str, Any],
+) -> float:
+    """Compute ATR-based initial stop with min/max % clipping."""
+    risk_cfg = cfg.get("risk", {})
+    initial_sl_cfg = risk_cfg.get("initial_sl", {})
+
+    # Backward compatibility with old `risk.sl_atr_k`.
+    sl_atr_k = float(
+        initial_sl_cfg.get(
+            "sl_atr_k",
+            risk_cfg.get("sl_atr_k", cfg.get("exit", {}).get("stop_atr_multiplier", 2.0)),
+        )
+    )
+    min_sl_pct = float(initial_sl_cfg.get("min_sl_pct", 0.0))
+    max_sl_pct = float(initial_sl_cfg.get("max_sl_pct", 100.0))
+
+    if entry_price <= 0:
+        return 0.0
+
+    if atr_value is None:
+        sl_pct_raw = min_sl_pct
+    else:
+        atr_clean = float(atr_value)
+        if not math.isfinite(atr_clean) or atr_clean <= 0:
+            sl_pct_raw = min_sl_pct
+        else:
+            sl_pct_raw = (atr_clean * sl_atr_k / entry_price) * 100.0
+    sl_pct = min(max(sl_pct_raw, min_sl_pct), max_sl_pct)
+    return entry_price * (1 - sl_pct / 100.0)
+
+
+def _check_entry_trigger(row: pd.Series, cfg: Dict[str, Any]) -> bool:
+    """Check entry trigger based on config: pullback, breakout, or both (OR).
+
+    In 'both' mode, EITHER pullback OR breakout is sufficient.
+    """
+    trigger_mode = cfg["entry"].get("trigger", "both")
+
+    if trigger_mode == "pullback":
+        return _check_pullback(row, cfg)
+    elif trigger_mode == "breakout":
+        return _check_breakout(row, cfg)
+    else:  # "both" = OR logic
+        return _check_pullback(row, cfg) or _check_breakout(row, cfg)
 
 
 def check_cooldown(
@@ -152,6 +212,21 @@ def check_cooldown(
     return False
 
 
+def check_cooldown_bars(
+    symbol: str,
+    cooldowns: Dict[str, int],
+    current_bar_idx: int,
+) -> bool:
+    """Return True if *symbol* is in bar-based cooldown.
+
+    cooldowns: {symbol: bar_index_when_cooldown_expires}
+    """
+    cd_bar = cooldowns.get(symbol)
+    if cd_bar is not None and current_bar_idx < cd_bar:
+        return True
+    return False
+
+
 # ============================================================
 # Main signal generator
 # ============================================================
@@ -163,17 +238,21 @@ def generate_signals(
     now: datetime,
     current_position: Optional[Position] = None,
     cooldowns: Optional[Dict[str, datetime]] = None,
+    cooldowns_bar: Optional[Dict[str, int]] = None,
+    current_bar_idx: int = 0,
 ) -> List[Signal]:
     """Evaluate entry conditions for each symbol and return candidate signals.
 
     Parameters
     ----------
     features_1h : {symbol: DataFrame} with computed 1h features
-    features_5m : {symbol: DataFrame} with computed 5m features
+    features_5m : {symbol: DataFrame} with computed 5m features (unused in trend version)
     cfg : full config dict
     now : current UTC datetime
     current_position : existing position (None if flat)
-    cooldowns : {symbol: cooldown_until_dt}
+    cooldowns : {symbol: cooldown_until_dt} (legacy hour-based)
+    cooldowns_bar : {symbol: bar_index} (new bar-based cooldown)
+    current_bar_idx : current bar index for bar-based cooldown
 
     Returns
     -------
@@ -181,6 +260,8 @@ def generate_signals(
     """
     if cooldowns is None:
         cooldowns = {}
+    if cooldowns_bar is None:
+        cooldowns_bar = {}
 
     # Block if already holding
     if current_position is not None:
@@ -190,53 +271,74 @@ def generate_signals(
 
     for symbol in cfg["exchange"]["symbols"]:
         df_1h = features_1h.get(symbol)
-        df_5m = features_5m.get(symbol)
         if df_1h is None or df_1h.empty:
             continue
 
         row = df_1h.iloc[-1]
 
-        # Regime gate
+        # --- Gate 1: Regime must be TREND_UP ---
+        # Hysteresis is now applied at the regime level, no need to check here
         if row.get("regime", Regime.RANGE) != Regime.TREND_UP:
             continue
-        if not _check_regime_hysteresis(df_1h, cfg):
+
+        # --- Gate 2: Cooldown (bar-based or time-based) ---
+        if cooldowns_bar:
+            if check_cooldown_bars(symbol, cooldowns_bar, current_bar_idx):
+                log.debug(f"{symbol} in bar cooldown until bar {cooldowns_bar.get(symbol)}")
+                continue
+        else:
+            cd = cooldowns.get(symbol)
+            if cd and now < cd:
+                log.debug(f"{symbol} in cooldown until {cd}")
+                continue
+
+        # --- Gate 3: ret_24h minimum (momentum filter) ---
+        if not _check_ret24h_minimum(row, cfg):
             continue
 
-        # Late-entry guard: skip if recent run-up is already too large.
-        if not _check_pre_entry_return_cap(df_1h, cfg):
+        # --- Gate 4: Entry filter (ADX + MA + ATR%) ---
+        if not _check_entry_filter(row, cfg):
             continue
 
-        # Cooldown gate
-        cd = cooldowns.get(symbol)
-        if cd and now < cd:
-            log.debug(f"{symbol} in cooldown until {cd}")
+        # --- Gate 5: ATR% minimum (legacy volatility filter) ---
+        if not _check_atr_pct_min(row, cfg):
             continue
 
-        # 5.1 Pullback
-        if not _check_pullback(row, cfg):
+        # --- Gate 6: Entry trigger (pullback OR breakout) ---
+        if not _check_entry_trigger(row, cfg):
             continue
 
-        # 5.2 Breakout + Volume
-        if not _check_breakout(row):
+        # --- Gate 7: Volume filter ---
+        if cfg["entry"].get("volume_above_sma", True) and not _check_volume(row):
             continue
-        if cfg["entry"]["volume_above_sma"] and not _check_volume(row):
-            continue
+
+        # --- Gate 8: Entry quality filter ---
         if not _check_entry_quality(row, cfg):
             continue
 
-        # 5.3 5m filter
-        if df_5m is not None and not df_5m.empty:
-            if not _check_5m_filter(df_5m, cfg):
-                continue
-
-        # Compute stop (section 6.1)
+        # --- Compute stop ---
         atr_val = row["atr"]
         entry_price = row["close"]
-        stop_by_atr = entry_price - cfg["exit"]["stop_atr_multiplier"] * atr_val
+
+        risk_cfg = cfg.get("risk", {})
+        initial_stop = compute_initial_stop_price(entry_price, atr_val, cfg)
+        stop_by_atr = initial_stop
+
+        structure_buffer = float(risk_cfg.get("stop_structure_buffer", 0.3))
         stop_by_structure = (
-            row["recent_swing_low"] - cfg["exit"]["stop_structure_buffer"] * atr_val
+            row["recent_swing_low"] - structure_buffer * atr_val
         )
         stop_price = max(stop_by_atr, stop_by_structure)
+
+        # Determine entry type
+        is_pullback = _check_pullback(row, cfg)
+        is_breakout = _check_breakout(row, cfg)
+        if is_pullback and is_breakout:
+            entry_type = "PULLBACK_BREAKOUT"
+        elif is_pullback:
+            entry_type = "PULLBACK"
+        else:
+            entry_type = "BREAKOUT"
 
         score = compute_score(row, cfg)
 
@@ -244,13 +346,13 @@ def generate_signals(
             ts=now,
             symbol=symbol,
             side=Side.BUY,
-            entry_type="PULLBACK_BREAKOUT",
+            entry_type=entry_type,
             score=score,
             stop_price=stop_price,
             entry_price=entry_price,
         )
         signals.append(sig)
-        log.info(f"Signal: {symbol} score={score:.4f} entry={entry_price:.2f} stop={stop_price:.2f}")
+        log.info(f"Signal: {symbol} type={entry_type} score={score:.4f} entry={entry_price:.2f} stop={stop_price:.2f}")
 
     # Sort by score descending
     signals.sort(key=lambda s: s.score, reverse=True)

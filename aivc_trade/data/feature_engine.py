@@ -39,6 +39,20 @@ def compute_features_1h(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
     df["donchian_low"] = ind.donchian_low(df["low"], p["donchian_period"])
     df["donchian_high_prev"] = df["donchian_high"].shift(1)
 
+    # Entry filter trend MA (configurable)
+    ef_cfg = cfg.get("entry_filter", {})
+    trend_ma_type = str(ef_cfg.get("trend_ma_type", "ema")).lower()
+    trend_ma_period = int(ef_cfg.get("trend_ma_period", p["ema_slow_period"]))
+    if trend_ma_type == "ema":
+        df["trend_ma"] = ind.ema(df["close"], trend_ma_period)
+    else:
+        df["trend_ma"] = ind.sma(df["close"], trend_ma_period)
+
+    # Breakout high for strict breakout trigger
+    breakout_cfg = cfg.get("entry_signal", {}).get("breakout", {})
+    breakout_lookback = int(breakout_cfg.get("lookback_bars", p["donchian_period"]))
+    df["breakout_high_prev"] = df["high"].rolling(breakout_lookback).max().shift(1)
+
     # Volume SMA
     df["volume_sma"] = ind.sma(df["volume"], p["volume_sma_period"])
 
@@ -48,6 +62,16 @@ def compute_features_1h(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
     # Max drop 6h (for CHAOS detection)
     chaos_lb = cfg["regime"]["chaos_drop_lookback"]
     df["max_drop_6h"] = ind.max_drop_pct(df["close"], chaos_lb)
+
+    # ret_1h: 1-bar return for CHAOS detection
+    df["ret_1h"] = df["close"].pct_change(1)
+
+    # ret_24h: 24-bar return for entry filter
+    df["ret_24h"] = df["close"].pct_change(24)
+
+    # ema_slow_slope: slope of slow EMA for TREND_UP verification
+    slope_bars = p.get("ema_slope_lookback", 8)
+    df["ema_slow_slope"] = ind.ema_slope(df["ema_slow"], slope_bars)
 
     return df
 

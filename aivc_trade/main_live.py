@@ -196,15 +196,32 @@ def main() -> None:
                     row = feat_1h[sym].iloc[-1]
                     current_close = client.get_ticker_price(sym)
                     current_atr = row["atr"]
+                    current_atrp = float(row.get("atrp", 0.0))
+                    current_adx = float(row.get("adx", 0.0))
+                    trend_ma_val = float(row.get("trend_ma", 0.0))
+                    current_high = float(row.get("high", current_close))
+                    current_low = float(row.get("low", current_close))
                     regime = classify_regime(row, cfg)
 
                     # Update trail
-                    position = pm.update_stop(position, current_close, current_atr)
+                    position = pm.update_stop(
+                        position,
+                        current_close,
+                        current_atr,
+                        now=now,
+                        current_atrp=current_atrp,
+                        current_high=current_high,
+                        current_low=current_low,
+                        current_adx=current_adx,
+                        trend_ma=trend_ma_val,
+                    )
 
                     # --- Check partial TP (live) ---
                     if (
                         not position.partial_taken
-                        and pm.check_partial_tp(position, current_close)
+                        and pm.check_partial_tp(
+                            position, current_close, current_adx=current_adx, trend_ma=trend_ma_val
+                        )
                     ):
                         partial_ratio = float(cfg.get("partial_tp", {}).get("ratio", 0.5))
                         partial_qty = position.initial_qty * partial_ratio
@@ -243,7 +260,10 @@ def main() -> None:
 
                     # Check exit
                     exit_reason = pm.check_exit(
-                        position, current_close, current_atr, regime, now
+                        position, current_close, current_atr, regime, now,
+                        ema_slow=float(row.get("ema_slow", 0.0)),
+                        current_adx=current_adx,
+                        trend_ma=trend_ma_val,
                     )
                     if exit_reason is not None:
                         # Execute sell
@@ -306,13 +326,17 @@ def main() -> None:
                                 qty=qty,
                                 entry_price=filled_price,
                                 stop_price=best.stop_price,
+                                initial_stop_price=0.0,
                                 entry_ts=now,
                                 highest_price=filled_price,
+                                lowest_price=filled_price,
                                 atr_at_entry=feat_1h[best.symbol].iloc[-1]["atr"],
                                 initial_qty=qty,
+                                bars_since_entry=0,
                             )
+                            pm.apply_initial_stop(position, position.atr_at_entry)
                             notifier.notify_entry(
-                                best.symbol, qty, filled_price, best.stop_price
+                                best.symbol, qty, filled_price, position.stop_price
                             )
                             cb.reset_api_errors()
 

@@ -16,6 +16,7 @@ class Regime(enum.Enum):
     TREND_UP = "TREND_UP"
     RANGE = "RANGE"
     CHAOS = "CHAOS"
+    OFF = "OFF"
 
 
 class Side(enum.Enum):
@@ -30,6 +31,7 @@ class OrderType(enum.Enum):
 
 class ExitReason(enum.Enum):
     STOP_LOSS = "STOP_LOSS"
+    EARLY_FAIL_EXIT = "EARLY_FAIL_EXIT"
     TRAILING_STOP = "TRAILING_STOP"
     TRAILING_STOP_RUNNER = "TRAILING_STOP_RUNNER"
     REGIME_EXIT = "REGIME_EXIT"
@@ -37,6 +39,7 @@ class ExitReason(enum.Enum):
     REGIME_EXIT_RANGE = "REGIME_EXIT_RANGE"
     REGIME_EXIT_RANGE_RUNNER = "REGIME_EXIT_RANGE_RUNNER"
     REGIME_EXIT_RANGE_RUNNER_TIMEOUT = "REGIME_EXIT_RANGE_RUNNER_TIMEOUT"
+    REGIME_EXIT_TIMEOUT = "REGIME_EXIT_TIMEOUT"
     PARTIAL_TP = "PARTIAL_TP"
     MANUAL = "MANUAL"
     CIRCUIT_BREAKER = "CIRCUIT_BREAKER"
@@ -114,6 +117,7 @@ class Position:
     qty: float
     entry_price: float
     stop_price: float
+    initial_stop_price: float = 0.0
     trail_price: float = 0.0
     entry_ts: Optional[datetime] = None
     cooldown_until: Optional[datetime] = None
@@ -130,6 +134,14 @@ class Position:
     partial_price: float = 0.0
     partial_time: Optional[datetime] = None
     runner_trail_price: float = 0.0
+    # Trend-focused additions
+    mode: str = "CORE"  # "CORE" or "RUNNER"
+    trail_activated: bool = False
+    breakeven_done: bool = False
+    regime_at_entry: str = ""
+    mfe_pct: float = 0.0
+    mae_pct: float = 0.0
+    bars_since_entry: int = 0
 
 
 @dataclass
@@ -174,7 +186,9 @@ class TradeRecord:
     event_type: str = "EXIT"
     runner_mode: bool = False
     regime_at_exit: str = ""
+    regime_at_entry: str = ""
     unrealized_pct_at_event: float = 0.0
+    bars_held: int = 0
 
 
 @dataclass

@@ -53,6 +53,7 @@ class StateManager:
                 "qty": p.qty,
                 "entry_price": p.entry_price,
                 "stop_price": p.stop_price,
+                "initial_stop_price": p.initial_stop_price,
                 "trail_price": p.trail_price,
                 "entry_ts": p.entry_ts.isoformat() if p.entry_ts else None,
                 "cooldown_until": p.cooldown_until.isoformat() if p.cooldown_until else None,
@@ -66,6 +67,8 @@ class StateManager:
                 "partial_price": p.partial_price,
                 "partial_time": p.partial_time.isoformat() if p.partial_time else None,
                 "runner_trail_price": p.runner_trail_price,
+                "breakeven_done": p.breakeven_done,
+                "bars_since_entry": p.bars_since_entry,
             }
         else:
             d["position"] = None
@@ -88,6 +91,7 @@ class StateManager:
                 qty=pos_data["qty"],
                 entry_price=pos_data["entry_price"],
                 stop_price=pos_data["stop_price"],
+                initial_stop_price=pos_data.get("initial_stop_price", 0.0),
                 trail_price=pos_data.get("trail_price", 0.0),
                 entry_ts=_parse_dt(pos_data.get("entry_ts")),
                 cooldown_until=_parse_dt(pos_data.get("cooldown_until")),
@@ -101,6 +105,8 @@ class StateManager:
                 partial_price=pos_data.get("partial_price", 0.0),
                 partial_time=_parse_dt(pos_data.get("partial_time")),
                 runner_trail_price=pos_data.get("runner_trail_price", 0.0),
+                breakeven_done=pos_data.get("breakeven_done", False),
+                bars_since_entry=int(pos_data.get("bars_since_entry", 0)),
             )
 
         state.last_signal_ts = _parse_dt(d.get("last_signal_ts"))

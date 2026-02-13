@@ -1,5 +1,5 @@
 # ============================================================
-# AIVC Trade - Phase A  Configuration
+# AIVC Trade - Trend-Focused Configuration
 # ============================================================
 
 exchange:
@@ -15,10 +15,10 @@ timeframes:
   monitor: 5m                # ストップ更新監視足
 
 position:
-  max_concurrent: 1          # 同時保有最大数
-  cooldown_hours: 6          # 決済後の再エントリ禁止(h)
-  stop_loss_cooldown_hours: 12
-  regime_exit_cooldown_hours: 8
+  max_concurrent: 2          # 同時保有最大数
+  cooldown_hours: 24         # 決済後の再エントリ禁止(h) ※後方互換用
+  stop_loss_cooldown_hours: 48
+  regime_exit_cooldown_hours: 24
 
 costs:
   commission_bps: 10         # 片道手数料 (bps)  = 0.10%
@@ -29,7 +29,7 @@ costs:
 indicators_1h:
   ema_fast_period: 20
   ema_slow_period: 50
-  ema_slope_lookback: 6      # slope 計算用 lookback (bars)
+  ema_slope_lookback: 8      # slope 計算用 lookback (bars)
   adx_period: 14
   atr_period: 14
   atrp_z_window: 200         # atrp z-score rolling window
@@ -48,60 +48,123 @@ indicators_5m:
 
 # ---------- Regime Thresholds ----------
 regime:
+  # CHAOS判定
   chaos_atrp_z: 2.0
   chaos_adx_trend_down: 25
   chaos_drop_multiplier: 3.0
   chaos_drop_lookback: 15     # 15h
+  chaos_atr_pct: 2.5          # ATR% >= 2.5% → CHAOS
+  chaos_ret_1h_pct: 1.8       # |ret_1h| >= 1.8% → CHAOS
+  # TREND_UP判定
   trend_slope_min: 0.0015
-  trend_adx_min: 18
+  trend_adx_min: 20            # ADX >= 20 (was 18)
   trend_atrp_z_min: -0.5
+  # RANGE判定
+  adx_range_max: 15            # ADX < 15 → RANGE
+  # ヒステリシス
+  regime_confirm_bars: 3       # regime切替に連続3本必要
 
 # ---------- Entry Conditions ----------
 entry:
-  pullback_threshold: 0.015  # |close - ema_fast|/close <= 1.5%
+  ret24h_min_pct: 2.0          # 直近24hリターン条件を緩和（攻撃寄り）
+  atr_pct_min: 1.0             # 旧ゲート（後方互換）
+  cooldown_bars: 24            # 決済後のクールダウン (bars, 24h)
+  trigger: breakout            # pullback | breakout | both
+  pullback_threshold: 0.015    # |close - ema_fast|/close <= 1.5%
   volume_above_sma: true
-  micro_vol_filter: true
-  regime_hysteresis_bars: 2
-  max_pre_entry_ret_3h: null    # nullで無効化（3h/24hどちらか一方で運用）
-  max_pre_entry_ret_24h: 0.03   # 直近24hの上昇率上限 (3.0%)
+
+entry_filter:
+  enabled: true
+  adx_min: 22
+  trend_ma_type: ema
+  trend_ma_period: 200
+  atr_pct_min: 0.25            # 0.25%未満の低ボラは除外
+
+entry_signal:
+  breakout:
+    enabled: true
+    lookback_bars: 48
+    buffer_pct: 0.10
 
 entry_quality:
   enabled: true
-  min_adx: 20
+  min_adx: 25
+  adx_strict_gt: true
   min_atrp: 0.006
   min_atrp_z: -0.2
-  min_volume_ratio: 1.05
-  min_slope: 0.0018
+  min_volume_ratio: 1.00
+  min_slope: 0.0015
+
+# ---------- Risk Management ----------
+risk:
+  sl_atr_k: 2.0               # 旧キー（後方互換）
+  stop_structure_buffer: 0.3   # max(ATR stop, swing_low - 0.3*ATR)
+  be_activate_pct: 1.5         # 旧キー（後方互換）
+  fee_buffer_bps: 8            # BE移動時の手数料バッファ
+  initial_sl:
+    enabled: true
+    sl_atr_k: 2.0
+    min_sl_pct: 0.6
+    max_sl_pct: 2.5
+  early_fail_exit:
+    enabled: true
+    window_bars: 6
+    min_mfe_pct: 0.25
+    max_mae_pct: 0.60
+    require_bad_regime: false
+    bad_regimes: ["RANGE", "CHAOS", "OFF"]
+  breakeven:
+    enabled: true
+    activate_mfe_pct: 0.8
+    buffer_pct: 0.05
 
 # ---------- Exit Conditions ----------
 exit:
-  stop_atr_multiplier: 2.2
-  stop_structure_buffer: 0.3 # atr * 0.3
-  trail_start_atr: 1.0      # 含み益 >= 1.0*atr で追随開始
-  trail_start_mfe_pct: 2.0  # MFE >= 2.0% になるまで追随開始しない
-  trail_atr_multiplier: 2.5
+  trail_start_atr: 1.0         # 含み益 >= 1.0*atr で追随開始
+  trail_start_mfe_pct: 2.0     # MFE >= 2.0% になるまで追随開始しない
+  trail_atr_multiplier: 2.5    # 通常トレール ATR乗数
   trail_min_holding_hours: 2
   trail_min_atrp: 0.004
-  regime_exit_confirm_bars: 3  # TREND_UP離脱が3本連続でEXIT
-  regime_exit_profit_confirm_bars: 6 # 含み益中のRANGEは6本連続でEXIT
-  chaos_exit_confirm_bars: 1 # CHAOSは原則即時EXIT
 
 # ---------- Partial Take-Profit / Runner Mode ----------
 partial_tp:
   enabled: true
-  threshold_pct: 2.0           # 含み益 +2.0% で50%利確
-  ratio: 0.5                   # 利確割合
+  threshold_pct: 4.2           # 早利確を抑えてランナー化を優先
+  ratio: 0.20                  # 利確割合を下げて伸ばす
+  max_count: 1                 # 最大1回
 
 runner:
-  buffer_pct: 1.0              # ランナーの利益バッファ閾値 (%)
-  range_exit_max_off_bars: 6   # バッファ有り時のRANGE最大猶予バー数
-  trail_activate_mfe_pct: 2.0  # ランナートレール有効化MFE閾値 (%)
-  trail_atr_k: 2.0             # ランナートレール ATR乗数
+  trail_atr_k: 3.8             # ランナーをやや緩く保持
+  trail_activate_mfe_pct: 4.5  # ランナートレール有効化MFE閾値 (%)
+  trail_start_mfe_pct: 2.0     # 旧キー（後方互換）
+  stop_buffer_pct: 0.0         # stopノイズバッファ (%)
+  range_exit_confirm_bars: 10  # RANGE連続N本 + 条件でExit (was 3/6)
+  max_off_bars: 18             # 非TREND_UP最大猶予バー数
+  min_mfe_to_hold_pct: 1.5     # 保持継続の最小MFE (%)
+  chaos_tighten_k: 1.5         # CHAOS時のstopタイト化 ATR乗数
+  chaos_emergency_tp_pct: 5.0  # CHAOS時の緊急部分利確MFE閾値 (%)
+
+# ---------- Exit Tuning ----------
+exit_tuning:
+  strong_trend_hold:
+    enabled: true
+    adx_min: 30
+    disable_range_exit: true
+    disable_partial_tp: true
+    partial_tp_threshold_add_pct: 0.0
+    trail_atr_k_multiplier: 1.2
+  trail_two_stage:
+    enabled: true
+    mfe_switch_pct: 6.0
+    atr_k_before: 3.5
+    atr_k_after: 2.7
+    apply_to_runner: true
+    apply_to_core: true
 
 # ---------- Position Sizing ----------
 sizing:
-  risk_per_trade: 0.05       # 口座資産の 5%
-  max_notional_pct: 0.95     # 最大投下比率
+  risk_per_trade: 0.08       # 口座資産の 8%（高リスク高リターン）
+  max_notional_pct: 1.00     # 最大投下比率
 
 # ---------- Symbol Score Weights ----------
 score:
