@@ -1,0 +1,26 @@
+{
+  "n_samples": 16,
+  "n_train": 9,
+  "n_valid": 3,
+  "n_test": 4,
+  "pos_rate": 0.125,
+  "scale_pos_weight": 9.0,
+  "valid_auc": 0.5,
+  "test_auc": 0.5,
+  "valid_at_threshold": {
+    "threshold": 0.72,
+    "precision": 0.0,
+    "recall": 0.0,
+    "reject_rate": 1.0,
+    "n_selected": 0,
+    "n_total": 3
+  },
+  "test_at_threshold": {
+    "threshold": 0.72,
+    "precision": 0.0,
+    "recall": 0.0,
+    "reject_rate": 1.0,
+    "n_selected": 0,
+    "n_total": 4
+  }
+}

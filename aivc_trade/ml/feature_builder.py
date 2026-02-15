@@ -62,16 +62,27 @@ PHASEB_FEATURE_COLS: List[str] = [
     "ret_24h",
     "atr",
     "atr_pct",
+    "adx",
     "vol_rolling_std",
     "ema_fast",
     "ema_slow",
     "ema_slope",
     "ma_gap",
+    "trend_strength",
     "vol_z",
+    "vol_spike",
     "vol_change",
+    "range_pos",
+    "drawdown_from_recent_high",
+    "gap_like",
+    "wick_up_ratio",
+    "wick_down_ratio",
     "regime_id",
     "regime_strength",
     "upper_wick_ratio",
+    "lower_wick_ratio",
+    "downside_vol",
+    "bear_pressure",
     "pump_24h_flag",
     "rsi_14",
     "rsi_overbought_flag",
@@ -122,7 +133,8 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     else:
         out["atr_pct"] = out["atr"] / (close + eps)
 
-    out["vol_rolling_std"] = close.pct_change().rolling(24, min_periods=5).std()
+    ret = close.pct_change()
+    out["vol_rolling_std"] = ret.rolling(24, min_periods=5).std()
 
     if "ema_fast" in df.columns:
         out["ema_fast"] = df["ema_fast"].astype(float)
@@ -136,11 +148,14 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
     out["ema_slope"] = out["ema_fast"].pct_change(8)
     out["ma_gap"] = (out["ema_fast"] - out["ema_slow"]) / (out["ema_slow"] + eps)
+    out["trend_strength"] = (out["ema_fast"] - out["ema_slow"]).abs() / (out["atr"] + eps)
 
     vol_mean = volume.rolling(20, min_periods=5).mean()
     vol_std = volume.rolling(20, min_periods=5).std().replace(0.0, np.nan)
     out["vol_z"] = (volume - vol_mean) / (vol_std + eps)
+    out["vol_spike"] = out["vol_z"]
     out["vol_change"] = volume.pct_change(1)
+    out["gap_like"] = (open_ - close.shift(1)) / (close.shift(1) + eps)
 
     if "regime" in df.columns:
         from aivc_trade.core.types import Regime
@@ -161,6 +176,26 @@ def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     out["upper_wick_ratio"] = (high - pd.concat([open_, close], axis=1).max(axis=1)) / (
         full_range + eps
     )
+    out["lower_wick_ratio"] = (pd.concat([open_, close], axis=1).min(axis=1) - low) / (full_range + eps)
+    out["wick_up_ratio"] = out["upper_wick_ratio"]
+    out["wick_down_ratio"] = out["lower_wick_ratio"]
+
+    range_high = high.rolling(24, min_periods=5).max()
+    range_low = low.rolling(24, min_periods=5).min()
+    out["range_pos"] = (close - range_low) / ((range_high - range_low) + eps)
+    out["drawdown_from_recent_high"] = (close - range_high) / (range_high + eps)
+
+    neg_ret = ret.where(ret < 0.0, np.nan)
+    out["downside_vol"] = neg_ret.rolling(24, min_periods=5).std()
+    out["bear_pressure"] = (close < open_).astype(float).rolling(12, min_periods=3).mean()
+
+    if "adx" in df.columns:
+        out["adx"] = df["adx"].astype(float)
+    elif "adx_14" in df.columns:
+        out["adx"] = df["adx_14"].astype(float)
+    else:
+        out["adx"] = 0.0
+
     out["pump_24h_flag"] = (out["ret_24h"] > 0.04).astype(float)
     out["rsi_14"] = _compute_rsi(close, period=14)
     out["rsi_overbought_flag"] = (out["rsi_14"] >= 70.0).astype(float)

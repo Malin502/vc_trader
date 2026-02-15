@@ -259,15 +259,43 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
             if float(short_trail.get("atr_k", 0.0)) <= 0:
                 raise ValueError("Invalid config: short.trail.atr_k must be > 0")
 
-    phase_b_cfg = cfg.get("phase_b", {})
+    phase_b_cfg = cfg.get("phaseb", cfg.get("phase_b", {}))
     if phase_b_cfg:
-        mode = str(phase_b_cfg.get("mode", "gate")).lower()
-        if mode != "gate":
-            raise ValueError("Invalid config: phase_b.mode must be gate")
+        mode = str(phase_b_cfg.get("mode", "directional")).lower()
+        if mode not in {"directional", "gate"}:
+            raise ValueError("Invalid config: phaseb.mode must be directional or gate")
+        if int(phase_b_cfg.get("horizon_bars", 24)) < 1:
+            raise ValueError("Invalid config: phaseb.horizon_bars must be >= 1")
+        if float(phase_b_cfg.get("cost_bps_roundtrip", 0.0)) < 0:
+            raise ValueError("Invalid config: phaseb.cost_bps_roundtrip must be >= 0")
+        model_long_cfg = phase_b_cfg.get("model_long", {})
+        model_short_cfg = phase_b_cfg.get("model_short", {})
+        for side_key, model_cfg in (("model_long", model_long_cfg), ("model_short", model_short_cfg)):
+            if model_cfg:
+                obj = str(model_cfg.get("objective", "quantile")).lower()
+                if obj not in {"quantile", "regression"}:
+                    raise ValueError(f"Invalid config: phaseb.{side_key}.objective must be quantile or regression")
+                alpha = float(model_cfg.get("alpha", 0.8))
+                if not (0.0 < alpha < 1.0):
+                    raise ValueError(f"Invalid config: phaseb.{side_key}.alpha must satisfy 0 < x < 1")
+                thr_cfg = model_cfg.get("threshold", {})
+                thr_mode = str(thr_cfg.get("mode", "top_pct")).lower()
+                if thr_mode not in {"top_pct", "fixed"}:
+                    raise ValueError(f"Invalid config: phaseb.{side_key}.threshold.mode must be top_pct or fixed")
+                if thr_mode == "top_pct":
+                    top_pct = float(thr_cfg.get("top_pct", 0.15))
+                    if not (0.0 <= top_pct <= 1.0):
+                        raise ValueError(
+                            f"Invalid config: phaseb.{side_key}.threshold.top_pct must satisfy 0 <= x <= 1"
+                        )
+                else:
+                    val = float(thr_cfg.get("value", 0.0))
+                    if not (-100.0 <= val <= 100.0):
+                        raise ValueError(
+                            f"Invalid config: phaseb.{side_key}.threshold.value seems out of range"
+                        )
         gate_cfg = phase_b_cfg.get("gate", {})
         if gate_cfg:
-            if not str(gate_cfg.get("model_path", "")).strip():
-                raise ValueError("Invalid config: phase_b.gate.model_path must be non-empty")
             thr = float(gate_cfg.get("threshold", 0.6))
             if not (0.0 <= thr <= 1.0):
                 raise ValueError("Invalid config: phase_b.gate.threshold must satisfy 0 <= x <= 1")

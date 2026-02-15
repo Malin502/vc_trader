@@ -249,8 +249,15 @@ def main() -> None:
         if hasattr(sim, "last_run_stats"):
             skips = sim.last_run_stats.get("phase_b_skips", []) or []
         if skips:
-            pd.DataFrame(skips).to_csv(results_dir / "skips.csv", index=False)
-            log.info(f"PhaseB skips saved → {results_dir / 'skips.csv'} ({len(skips)} rows)")
+            pb_cfg = cfg.get("phaseb", cfg.get("phase_b", {}))
+            log_skips = bool(pb_cfg.get("log_skips", pb_cfg.get("gate", {}).get("log_skips", True)))
+            if log_skips:
+                log_path = Path("logs/phaseb_skips.csv")
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(skips).to_csv(log_path, index=False)
+                # Keep a copy in backtest results for experiment tracking.
+                pd.DataFrame(skips).to_csv(results_dir / "phaseb_skips.csv", index=False)
+                log.info(f"PhaseB skips saved → {log_path} ({len(skips)} rows)")
 
         quality_df = _data_quality_checks(candles_1h, candles_5m)
         quality_df.to_csv(results_dir / "data_quality_checks.csv", index=False)

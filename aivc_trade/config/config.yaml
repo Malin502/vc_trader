@@ -358,50 +358,55 @@ backtest:
   walkforward: false          # true: walk-forward分析を実行
   offline: false              # true: ネットワークアクセス禁止（キャッシュのみ使用）
 
-# ---------- PhaseB ML Entry Filter ----------
-ml_filter:
+# ---------- PhaseB Directional Filter ----------
+phaseb:
   enabled: false
-  apply_to: short_only
-  model_dir: data/models
-  threshold: 0.45                   # tuned by backtest sweep (2026-02-15)
-  on_missing_model: fail            # pass: 全通過で継続, fail: エラーで停止
-  # Label definition
-  label_horizon_bars: 24            # H=24h lookahead
-  label_tp_thr: 0.015              # +1.5% take-profit threshold
-  label_dd_thr: 0.010              # -1.0% max drawdown threshold
-  # Walk-forward splits
-  train_days: 270
-  valid_days: 60
-  test_days: 60
-  purge_bars: 24                    # Gap in bars between train/valid
-  step_days: 60
-  min_trades_for_threshold: 50      # Min trades to consider a threshold
-  # LightGBM hyperparameters
-  num_boost_round: 1200
-  early_stopping_rounds: 200
-  lgb_params:
-    metric: auc
-    learning_rate: 0.01
-    num_leaves: 15
-    max_depth: 4
-    min_child_samples: 80
-    feature_fraction: 0.90
-    bagging_fraction: 0.90
-    bagging_freq: 1
-    lambda_l1: 0.4
-    lambda_l2: 1.0
-    min_gain_to_split: 0.0
+  mode: directional
+  timeframe: "1h"
+  horizon_bars: 24
+  cost_bps_roundtrip: 20
+  w_mae: 1.0
+  log_skips: true
+  meta_path: models/phaseb_meta.json
 
-# ---------- PhaseB Gate Filter ----------
-phase_b:
-  enabled: false
-  mode: gate
-  model_dir: data/models
-  on_missing_model: fail
-  gate:
-    dataset_path: data/phase_b/dataset.parquet
-    model_path: models/phase_b_gate.txt
-    threshold: 0.6
-    min_samples_for_enable: 3000
-    retrain:
+  model_long:
+    model_path: models/phaseb_long_lgbm.pkl
+    objective: quantile
+    alpha: 0.8
+    params:
+      num_leaves: 63
+      learning_rate: 0.03
+      n_estimators: 3000
+      min_data_in_leaf: 200
+      feature_fraction: 0.7
+      bagging_fraction: 0.7
+      bagging_freq: 1
+      lambda_l1: 0.0
+      lambda_l2: 1.0
+    threshold:
+      mode: top_pct
+      top_pct: 0.15
+    extra_filters:
       enabled: false
+
+  model_short:
+    model_path: models/phaseb_short_lgbm.pkl
+    objective: quantile
+    alpha: 0.8
+    params:
+      num_leaves: 63
+      learning_rate: 0.03
+      n_estimators: 3000
+      min_data_in_leaf: 200
+      feature_fraction: 0.7
+      bagging_fraction: 0.7
+      bagging_freq: 1
+      lambda_l1: 0.0
+      lambda_l2: 1.0
+    threshold:
+      mode: top_pct
+      top_pct: 0.10
+    extra_filters:
+      enabled: true
+      atr_pct_min: 0.008
+      adx_min: 18

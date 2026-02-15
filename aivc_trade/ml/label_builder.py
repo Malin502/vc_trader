@@ -106,9 +106,9 @@ def compute_labels_from_config(
     df: pd.DataFrame,
     cfg: Dict[str, Any],
 ) -> pd.Series:
-    """Compute labels using parameters from the ``ml_filter`` config section."""
-    ml_cfg = cfg.get("ml_filter", {})
-    horizon = int(ml_cfg.get("label_horizon_bars", 24))
-    tp_thr = float(ml_cfg.get("label_tp_thr", 0.015))
-    dd_thr = float(ml_cfg.get("label_dd_thr", 0.010))
+    """Compute labels using config defaults for PhaseB label generation."""
+    phase_b_cfg = cfg.get("phaseb", cfg.get("phase_b", {})).get("gate", {})
+    horizon = int(phase_b_cfg.get("label_horizon_bars", 24))
+    tp_thr = float(phase_b_cfg.get("label_tp_thr", 0.015))
+    dd_thr = float(phase_b_cfg.get("label_dd_thr", 0.010))
     return compute_labels(df, horizon_bars=horizon, tp_thr=tp_thr, dd_thr=dd_thr)

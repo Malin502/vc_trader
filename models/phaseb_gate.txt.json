@@ -1,0 +1,55 @@
+{
+  "mode": "phase_b_gate",
+  "model_file": "phaseb_gate.txt",
+  "feature_cols": [
+    "aligned_ret_1h",
+    "aligned_ret_4h",
+    "aligned_ret_24h",
+    "aligned_ema_slope_pct",
+    "aligned_price_vs_ema",
+    "aligned_breakout",
+    "adx_14",
+    "adx_diff",
+    "atr_pct",
+    "atr_pct_change",
+    "bb_width",
+    "range_width_pct",
+    "time_of_day_sin",
+    "time_of_day_cos",
+    "symbol_id",
+    "phaseA_score",
+    "loss_streak",
+    "stoploss_streak",
+    "hours_since_last_trade_symbol",
+    "hours_since_last_trade_global",
+    "was_in_halt_recently"
+  ],
+  "threshold": 0.72,
+  "n_samples": 16,
+  "metrics": {
+    "n_samples": 16,
+    "n_train": 9,
+    "n_valid": 3,
+    "n_test": 4,
+    "pos_rate": 0.125,
+    "scale_pos_weight": 9.0,
+    "valid_auc": 0.5,
+    "test_auc": 0.5,
+    "valid_at_threshold": {
+      "threshold": 0.72,
+      "precision": 0.0,
+      "recall": 0.0,
+      "reject_rate": 1.0,
+      "n_selected": 0,
+      "n_total": 3
+    },
+    "test_at_threshold": {
+      "threshold": 0.72,
+      "precision": 0.0,
+      "recall": 0.0,
+      "reject_rate": 1.0,
+      "n_selected": 0,
+      "n_total": 4
+    }
+  }
+}

@@ -38,8 +38,8 @@ from aivc_trade.strategy.regime import classify_regime, apply_regime_hysteresis
 from aivc_trade.strategy.signal import generate_signals
 from aivc_trade.strategy.sizing import compute_qty
 from aivc_trade.execution.position_manager import PositionManager
-from aivc_trade.ml.entry_filter import create_entry_filter
-from aivc_trade.ml.phase_b_gate import create_phase_b_gate
+from aivc_trade.ml.feature_builder import build_features
+from aivc_trade.ml.gate import create_phase_b_gate
 
 log = get_logger("simulator")
 
@@ -94,8 +94,6 @@ class Simulator:
             cfg.get("entry_filter", {}).get("score_percentile_lookback", 100)
         )
         self.last_run_stats: Dict[str, Any] = {}
-        # PhaseB ML entry filter
-        self.entry_filter = create_entry_filter(cfg)
         # PhaseB gate model (binary allow/skip)
         self.phase_b_gate = create_phase_b_gate(cfg)
 
@@ -130,15 +128,10 @@ class Simulator:
             df = feat_1h[sym]
             raw_regimes = df.apply(lambda row: classify_regime(row, self.cfg), axis=1)
             df["regime"] = apply_regime_hysteresis(raw_regimes, confirm_bars)
-
-        # --- PhaseB: precompute ML features indexed by (symbol, ts) ---
-        ml_feat_indexed: Dict[str, pd.DataFrame] = {}
-        if self.entry_filter.enabled and self.entry_filter.registry.is_loaded:
-            self.entry_filter.clear_cache()
-            for sym in feat_1h:
-                ml_feat = self.entry_filter.compute_and_cache_ml_features(sym, feat_1h[sym])
-                ml_feat["ts"] = pd.to_datetime(ml_feat["ts"], utc=True)
-                ml_feat_indexed[sym] = ml_feat.set_index("ts")
+            # Precompute PhaseB feature columns to avoid single-row inference drift.
+            phaseb_x, phaseb_cols = build_features(df)
+            for col in phaseb_cols:
+                df[col] = phaseb_x[col].astype(float)
 
         # --- Build unified 1h timeline (ensure UTC aware) ---
         all_ts = set()
@@ -174,15 +167,6 @@ class Simulator:
         equity_records: List[Dict[str, Any]] = []
         phase_b_skips: List[Dict[str, Any]] = []
         entry_bar_idx: int = 0  # bar index when position was entered
-
-        # --- PhaseB debug counters ---
-        ml_stats = {
-            "signals_total": 0,
-            "signals_scored_by_ml": 0,
-            "signals_missing_ml_ts": 0,
-            "signals_passed_ml": 0,
-            "signals_blocked_ml": 0,
-        }
 
         # Pre-index 5m data for quick lookup
         _5m_idx = {}
@@ -396,37 +380,6 @@ class Simulator:
                     current_bar_idx=i,
                     short_setup_states=short_setup_states,
                 )
-                # --- PhaseB: filter signals through ML model ---
-                if signals:
-                    ml_stats["signals_total"] += len(signals)
-                if signals and ml_feat_indexed:
-                    ml_apply_to = str(self.cfg.get("ml_filter", {}).get("apply_to", "all")).lower()
-                    filtered_signals = []
-                    for sig in signals:
-                        if ml_apply_to == "short_only" and sig.direction != Direction.SHORT:
-                            filtered_signals.append(sig)
-                            continue
-                        ml_df = ml_feat_indexed.get(sig.symbol)
-                        if ml_df is None or ts not in ml_df.index:
-                            ml_stats["signals_missing_ml_ts"] += 1
-                            filtered_signals.append(sig)
-                            continue
-                        ml_stats["signals_scored_by_ml"] += 1
-                        passed, score = self.entry_filter.filter_signal_at_ts(
-                            sig, ts, recent_trades=trades
-                        )
-                        if passed:
-                            sig.ml_score = score
-                            ml_stats["signals_passed_ml"] += 1
-                            filtered_signals.append(sig)
-                        else:
-                            ml_stats["signals_blocked_ml"] += 1
-                            log.debug(
-                                f"PhaseB SKIP: {sig.symbol} "
-                                f"score={score:.6f}"
-                            )
-                    signals = filtered_signals
-
                 # Entry score percentile guard
                 if signals and self.score_percentile > 0:
                     filtered_by_score = []
@@ -458,27 +411,22 @@ class Simulator:
                             filtered_signals.append(sig)
                             continue
                         row = feat_df.iloc[-1]
-                        p_allow = self.phase_b_gate.predict_proba(
-                            symbol=sig.symbol,
-                            side=sig.direction.value.lower(),
-                            score=float(sig.score),
-                            row=row,
-                            loss_streak=int(loss_streak.get(sig.symbol, 0)),
-                            stoploss_streak=int(stoploss_streak.get(sig.symbol, 0)),
-                            regime_halt_active=bool(strategy_halt_until is not None and ts < strategy_halt_until),
-                            last_trade_pnl=float(trades[-1].pnl if trades else 0.0),
+                        gate_result = self.phase_b_gate.evaluate(
+                            phaseA_signal=sig.direction,
+                            feature_row=row,
                         )
-                        if p_allow >= self.phase_b_gate.threshold:
+                        if gate_result.allow_entry:
                             filtered_signals.append(sig)
                         else:
                             phase_b_skips.append(
                                 {
-                                    "ts": ts,
+                                    "time": ts,
                                     "symbol": sig.symbol,
                                     "side": sig.direction.value,
-                                    "score": float(sig.score),
-                                    "p_allow": float(p_allow),
-                                    "reason": "PHASE_B_REJECT",
+                                    "phaseA_score": float(sig.score),
+                                    "phaseB_score": float(gate_result.phaseb_score),
+                                    "threshold": float(gate_result.threshold_used),
+                                    "reason": str(gate_result.reason),
                                 }
                             )
                     signals = filtered_signals
@@ -615,20 +563,6 @@ class Simulator:
             f"Backtest done: {len(trades)} trades, "
             f"final equity={equity:.2f}"
         )
-        if ml_feat_indexed:
-            log.info(
-                f"PhaseB ML summary: "
-                f"signals_total={ml_stats['signals_total']} "
-                f"scored_by_ml={ml_stats['signals_scored_by_ml']} "
-                f"missing_ml_ts={ml_stats['signals_missing_ml_ts']} "
-                f"passed_ml={ml_stats['signals_passed_ml']} "
-                f"blocked_ml={ml_stats['signals_blocked_ml']}"
-            )
-            if ml_stats["signals_missing_ml_ts"] > 0:
-                log.warning(
-                    f"PhaseB: {ml_stats['signals_missing_ml_ts']} signals had no "
-                    f"matching ML timestamp — check timezone alignment"
-                )
         self.last_run_stats = {
             "regime_halts": int(regime_halts),
             "strategy_halt_until": strategy_halt_until,

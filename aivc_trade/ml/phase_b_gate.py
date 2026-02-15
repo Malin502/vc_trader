@@ -1,4 +1,4 @@
-"""PhaseB gate model for allow/skip entry decisions."""
+"""PhaseB gate model for allow/skip entry decisions (v1)."""
 
 from __future__ import annotations
 
@@ -16,23 +16,30 @@ log = get_logger("phase_b_gate")
 
 
 PHASE_B_GATE_FEATURES = [
-    "ret_1h",
-    "ret_24h",
-    "rsi_14",
-    "atr",
+    # Direction-aligned features
+    "aligned_ret_1h",
+    "aligned_ret_4h",
+    "aligned_ret_24h",
+    "aligned_ema_slope_pct",
+    "aligned_price_vs_ema",
+    "aligned_breakout",
+    # Non-directional features
+    "adx_14",
+    "adx_diff",
     "atr_pct",
+    "atr_pct_change",
     "bb_width",
-    "ema_slope_pct",
-    "adx",
-    "range_pct",
-    "upper_wick_ratio",
-    "lower_wick_ratio",
-    "score",
-    "side_is_short",
+    "range_width_pct",
+    "time_of_day_sin",
+    "time_of_day_cos",
+    "symbol_id",
+    # PhaseA / state
+    "phaseA_score",
     "loss_streak",
     "stoploss_streak",
-    "regime_halt_active",
-    "last_trade_pnl",
+    "hours_since_last_trade_symbol",
+    "hours_since_last_trade_global",
+    "was_in_halt_recently",
 ]
 
 
@@ -45,31 +52,61 @@ def build_gate_feature_dict(
     stoploss_streak: int,
     regime_halt_active: bool,
     last_trade_pnl: float,
+    symbol_id: float = 0.0,
+    hours_since_last_trade_symbol: float = 0.0,
+    hours_since_last_trade_global: float = 0.0,
+    was_in_halt_recently: bool = False,
 ) -> Dict[str, float]:
+    eps = 1e-12
     close = float(row.get("close", 0.0))
-    high = float(row.get("high", close))
-    low = float(row.get("low", close))
-    open_px = float(row.get("open", close))
-    full_range = max(high - low, 1e-12)
+    adx = float(row.get("adx_14", row.get("adx", 0.0)))
+    adx_diff = float(row.get("adx_diff", 0.0))
+    atr_pct = float(row.get("atrp", row.get("atr_pct", 0.0)))
+    atr_pct_change = float(row.get("atr_pct_change", 0.0))
+    bb_width = float(row.get("bb_width", 0.0))
+    ema_50 = float(row.get("ema_50", row.get("ema_slow", 0.0)))
+    ema_slope_pct = float(row.get("ema_50_slope_pct", row.get("slope", 0.0)))
+    ret_1h = float(row.get("ret_1h", 0.0))
+    ret_4h = float(row.get("ret_4h", 0.0))
+    ret_24h = float(row.get("ret_24h", 0.0))
+    range_width_pct = float(row.get("range_width_pct", 0.0))
+    breakout_ref = float(row.get("breakout_ref", close))
+    breakout_strength = (close - breakout_ref) / max(abs(breakout_ref), eps)
+    side_sign = -1.0 if str(side).lower() == "short" else 1.0
 
+    ts = row.get("ts")
+    if ts is None:
+        ts_utc = pd.Timestamp.now(tz="UTC")
+    else:
+        ts_utc = pd.Timestamp(ts)
+        if ts_utc.tzinfo is None:
+            ts_utc = ts_utc.tz_localize("UTC")
+        else:
+            ts_utc = ts_utc.tz_convert("UTC")
+    hour = float(ts_utc.hour)
+    theta = (hour / 24.0) * (2.0 * np.pi)
     return {
-        "ret_1h": float(row.get("ret_1h", 0.0)),
-        "ret_24h": float(row.get("ret_24h", 0.0)),
-        "rsi_14": float(row.get("rsi_14", 0.0)),
-        "atr": float(row.get("atr", 0.0)),
-        "atr_pct": float(row.get("atrp", row.get("atr_pct", 0.0))),
-        "bb_width": float(row.get("bb_width", 0.0)),
-        "ema_slope_pct": float(row.get("ema_50_slope_pct", row.get("slope", 0.0))),
-        "adx": float(row.get("adx_14", row.get("adx", 0.0))),
-        "range_pct": (high - low) / close if close > 0 else 0.0,
-        "upper_wick_ratio": (high - max(open_px, close)) / full_range,
-        "lower_wick_ratio": (min(open_px, close) - low) / full_range,
-        "score": float(score),
-        "side_is_short": 1.0 if str(side).lower() == "short" else 0.0,
+        "aligned_ret_1h": ret_1h * side_sign,
+        "aligned_ret_4h": ret_4h * side_sign,
+        "aligned_ret_24h": ret_24h * side_sign,
+        "aligned_ema_slope_pct": ema_slope_pct * side_sign,
+        "aligned_price_vs_ema": (((close - ema_50) / max(abs(ema_50), eps)) * side_sign) if ema_50 != 0 else 0.0,
+        "aligned_breakout": breakout_strength * side_sign,
+        "adx_14": adx,
+        "adx_diff": adx_diff,
+        "atr_pct": atr_pct,
+        "atr_pct_change": atr_pct_change,
+        "bb_width": bb_width,
+        "range_width_pct": range_width_pct,
+        "time_of_day_sin": float(np.sin(theta)),
+        "time_of_day_cos": float(np.cos(theta)),
+        "symbol_id": float(symbol_id),
+        "phaseA_score": float(score),
         "loss_streak": float(loss_streak),
         "stoploss_streak": float(stoploss_streak),
-        "regime_halt_active": 1.0 if regime_halt_active else 0.0,
-        "last_trade_pnl": float(last_trade_pnl),
+        "hours_since_last_trade_symbol": float(hours_since_last_trade_symbol),
+        "hours_since_last_trade_global": float(hours_since_last_trade_global),
+        "was_in_halt_recently": 1.0 if was_in_halt_recently else 0.0,
     }
 
 
@@ -83,10 +120,18 @@ class PhaseBGate:
             pb_cfg.get("mode", "gate")
         ).lower() == "gate"
         gate_cfg = pb_cfg.get("gate", {})
-        model_path = gate_cfg.get("model_path", pb_cfg.get("model_path", "models/phase_b_gate.txt"))
+        model_path = gate_cfg.get("model_path", pb_cfg.get("model_path", "models/phaseb_gate.txt"))
         self.model_path = Path(model_path)
-        self.threshold = float(gate_cfg.get("threshold", pb_cfg.get("threshold", 0.6)))
-        self.min_samples_for_enable = int(gate_cfg.get("min_samples_for_enable", pb_cfg.get("min_samples_for_enable", 3000)))
+        self.threshold = float(gate_cfg.get("threshold", pb_cfg.get("threshold", 0.72)))
+        self.min_samples_for_enable = int(
+            gate_cfg.get(
+                "min_candidates",
+                pb_cfg.get(
+                    "min_candidates",
+                    gate_cfg.get("min_samples_for_enable", pb_cfg.get("min_samples_for_enable", 200)),
+                ),
+            )
+        )
         self.model: Optional[lgb.Booster] = None
         self.feature_cols = list(PHASE_B_GATE_FEATURES)
         self.loaded = False
@@ -110,7 +155,7 @@ class PhaseBGate:
             self.n_samples = int(meta.get("n_samples", 0))
         if self.n_samples and self.n_samples < self.min_samples_for_enable:
             log.warning(
-                f"PhaseB gate disabled: n_samples={self.n_samples} < min_samples_for_enable={self.min_samples_for_enable}"
+                f"PhaseB gate disabled: n_samples={self.n_samples} < min_candidates={self.min_samples_for_enable}"
             )
             self.enabled = False
             return
@@ -127,6 +172,10 @@ class PhaseBGate:
         stoploss_streak: int,
         regime_halt_active: bool,
         last_trade_pnl: float,
+        symbol_id: float = 0.0,
+        hours_since_last_trade_symbol: float = 0.0,
+        hours_since_last_trade_global: float = 0.0,
+        was_in_halt_recently: bool = False,
     ) -> float:
         if not self.enabled or self.model is None:
             return 1.0
@@ -138,6 +187,10 @@ class PhaseBGate:
             stoploss_streak=stoploss_streak,
             regime_halt_active=regime_halt_active,
             last_trade_pnl=last_trade_pnl,
+            symbol_id=symbol_id,
+            hours_since_last_trade_symbol=hours_since_last_trade_symbol,
+            hours_since_last_trade_global=hours_since_last_trade_global,
+            was_in_halt_recently=was_in_halt_recently,
         )
         x = np.array([feat.get(c, 0.0) for c in self.feature_cols], dtype=float).reshape(1, -1)
         x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)

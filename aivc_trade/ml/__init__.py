@@ -1,1 +1,1 @@
-"""PhaseB ML entry filter package."""
+"""PhaseB ML package."""
