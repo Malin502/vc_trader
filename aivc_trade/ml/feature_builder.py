@@ -56,6 +56,122 @@ ML_FEATURE_COLS: List[str] = [
 ]
 
 
+PHASEB_FEATURE_COLS: List[str] = [
+    "ret_1h",
+    "ret_4h",
+    "ret_24h",
+    "atr",
+    "atr_pct",
+    "vol_rolling_std",
+    "ema_fast",
+    "ema_slow",
+    "ema_slope",
+    "ma_gap",
+    "vol_z",
+    "vol_change",
+    "regime_id",
+    "regime_strength",
+    "upper_wick_ratio",
+    "pump_24h_flag",
+    "rsi_14",
+    "rsi_overbought_flag",
+    "atr_change",
+]
+
+
+def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.where(delta > 0.0, 0.0)
+    loss = (-delta.where(delta < 0.0, 0.0)).abs()
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rs = avg_gain / (avg_loss.replace(0.0, np.nan))
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def build_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Build leak-free PhaseB features for directional quantile models."""
+    out = pd.DataFrame(index=df.index)
+    eps = 1e-10
+
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    open_ = df["open"].astype(float)
+    volume = df["volume"].astype(float)
+
+    out["ret_1h"] = close.pct_change(1)
+    out["ret_4h"] = close.pct_change(4)
+    out["ret_24h"] = close.pct_change(24)
+
+    if "atr" in df.columns:
+        out["atr"] = df["atr"].astype(float)
+    else:
+        tr = pd.concat(
+            [
+                (high - low),
+                (high - close.shift(1)).abs(),
+                (low - close.shift(1)).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+        out["atr"] = tr.rolling(14, min_periods=1).mean()
+
+    if "atrp" in df.columns:
+        out["atr_pct"] = df["atrp"].astype(float)
+    else:
+        out["atr_pct"] = out["atr"] / (close + eps)
+
+    out["vol_rolling_std"] = close.pct_change().rolling(24, min_periods=5).std()
+
+    if "ema_fast" in df.columns:
+        out["ema_fast"] = df["ema_fast"].astype(float)
+    else:
+        out["ema_fast"] = close.ewm(span=20, adjust=False).mean()
+
+    if "ema_slow" in df.columns:
+        out["ema_slow"] = df["ema_slow"].astype(float)
+    else:
+        out["ema_slow"] = close.ewm(span=50, adjust=False).mean()
+
+    out["ema_slope"] = out["ema_fast"].pct_change(8)
+    out["ma_gap"] = (out["ema_fast"] - out["ema_slow"]) / (out["ema_slow"] + eps)
+
+    vol_mean = volume.rolling(20, min_periods=5).mean()
+    vol_std = volume.rolling(20, min_periods=5).std().replace(0.0, np.nan)
+    out["vol_z"] = (volume - vol_mean) / (vol_std + eps)
+    out["vol_change"] = volume.pct_change(1)
+
+    if "regime" in df.columns:
+        from aivc_trade.core.types import Regime
+
+        regime_map = {
+            Regime.TREND_UP: 0.0,
+            Regime.RANGE: 1.0,
+            Regime.CHAOS: 2.0,
+            Regime.OFF: 3.0,
+        }
+        out["regime_id"] = df["regime"].map(regime_map).fillna(1.0).astype(float)
+        out["regime_strength"] = (out["regime_id"] == 0.0).astype(float)
+    else:
+        out["regime_id"] = 1.0
+        out["regime_strength"] = 0.0
+
+    full_range = (high - low).replace(0.0, np.nan)
+    out["upper_wick_ratio"] = (high - pd.concat([open_, close], axis=1).max(axis=1)) / (
+        full_range + eps
+    )
+    out["pump_24h_flag"] = (out["ret_24h"] > 0.04).astype(float)
+    out["rsi_14"] = _compute_rsi(close, period=14)
+    out["rsi_overbought_flag"] = (out["rsi_14"] >= 70.0).astype(float)
+    atr_24h_ma = out["atr"].rolling(24, min_periods=5).mean()
+    out["atr_change"] = out["atr"] / (atr_24h_ma + eps) - 1.0
+
+    out = out[PHASEB_FEATURE_COLS]
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out, list(PHASEB_FEATURE_COLS)
+
+
 def compute_ml_features(
     df: pd.DataFrame,
     cfg: Dict[str, Any],

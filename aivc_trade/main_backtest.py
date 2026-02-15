@@ -151,10 +151,22 @@ def _data_quality_checks(
 
 
 def _risk_and_fee_checks(cfg: Dict[str, Any], trades_df: pd.DataFrame) -> pd.DataFrame:
-    commission = float(cfg["costs"]["commission_bps"])
-    slippage = float(cfg["costs"]["slippage_bps"])
+    fees_cfg = cfg.get("fees", {})
+    costs_cfg = cfg.get("costs", {})
+    slippage = float(costs_cfg.get("slippage_bps", 0.0))
+    if fees_cfg.get("enabled", False):
+        model = str(fees_cfg.get("model", "flat")).lower()
+        if model == "binance_spot":
+            spot_cfg = fees_cfg.get("binance_spot", {})
+            commission = float(spot_cfg.get("taker", 0.0010)) * 10_000.0
+            discount = float(spot_cfg.get("bnb_discount", 0.0))
+            commission = commission * max(0.0, 1.0 - discount)
+        else:
+            commission = float(fees_cfg.get("flat_rate", 0.001)) * 10_000.0
+    else:
+        commission = float(costs_cfg.get("commission_bps", 0.0))
     expected_roundtrip = 2.0 * (commission + slippage)
-    configured_roundtrip = float(cfg["costs"]["roundtrip_cost_bps"])
+    configured_roundtrip = float(costs_cfg.get("roundtrip_cost_bps", expected_roundtrip))
     rows = [
         {
             "check": "roundtrip_cost_bps_consistency",
@@ -224,6 +236,8 @@ def main() -> None:
         metrics = compute_metrics(
             trades, equity_curve, cfg["backtest"]["initial_equity"]
         )
+        if hasattr(sim, "last_run_stats"):
+            metrics["regime_halts"] = int(sim.last_run_stats.get("regime_halts", 0))
         print_report(metrics)
 
         # Save results
@@ -231,6 +245,12 @@ def main() -> None:
         results_dir.mkdir(parents=True, exist_ok=True)
         save_backtest_reports(metrics, trades, equity_curve, results_dir, candles_1h=candles_1h)
         log.info(f"Backtest reports saved → {results_dir}")
+        skips = []
+        if hasattr(sim, "last_run_stats"):
+            skips = sim.last_run_stats.get("phase_b_skips", []) or []
+        if skips:
+            pd.DataFrame(skips).to_csv(results_dir / "skips.csv", index=False)
+            log.info(f"PhaseB skips saved → {results_dir / 'skips.csv'} ({len(skips)} rows)")
 
         quality_df = _data_quality_checks(candles_1h, candles_5m)
         quality_df.to_csv(results_dir / "data_quality_checks.csv", index=False)

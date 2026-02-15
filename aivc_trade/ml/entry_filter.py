@@ -35,7 +35,7 @@ class EntryFilter:
         ml_cfg = cfg.get("ml_filter", {})
         self.enabled = bool(ml_cfg.get("enabled", False))
         self.model_dir = str(ml_cfg.get("model_dir", "data/models"))
-        self.on_missing_model: str = str(ml_cfg.get("on_missing_model", "pass"))
+        self.on_missing_model = str(ml_cfg.get("on_missing_model", "pass"))
         self.registry = ModelRegistry(self.model_dir)
         self._ml_features_cache: Dict[str, pd.DataFrame] = {}
 
@@ -63,6 +63,10 @@ class EntryFilter:
                 f"(on_missing_model={self.on_missing_model}). "
                 "Filter will pass all signals."
             )
+        else:
+            configured_thr = self.cfg.get("ml_filter", {}).get("threshold")
+            if configured_thr is not None:
+                self.registry.set_threshold(float(configured_thr))
         return loaded
 
     def compute_and_cache_ml_features(
@@ -125,28 +129,57 @@ class EntryFilter:
             log.warning(f"Empty ML features for {sym}, passing signal")
             return True, 1.0
 
-        # Grab latest row
-        ml_row = ml_feat.iloc[-1].copy()
+        return self._score_with_row(signal, ml_feat.iloc[-1].copy(), recent_trades or [])
 
-        # Patch signal-time features
-        ml_row = patch_signal_features(ml_row, signal, recent_trades or [])
+    def filter_signal_at_ts(
+        self,
+        signal: Any,
+        ts: pd.Timestamp,
+        recent_trades: Optional[List[Any]] = None,
+    ) -> Tuple[bool, float]:
+        """Score a signal using cached feature row aligned to a specific timestamp."""
+        if not self.enabled:
+            return True, 1.0
+        if not self.registry.is_loaded:
+            if self.on_missing_model == "fail":
+                raise RuntimeError(
+                    "PhaseB filter_signal_at_ts called but no model is loaded "
+                    f"(on_missing_model={self.on_missing_model})"
+                )
+            return True, 1.0
 
-        # Build feature vector in canonical order
+        sym = signal.symbol
+        ml_feat = self._ml_features_cache.get(sym)
+        if ml_feat is None or ml_feat.empty:
+            return True, 1.0
+
+        target_ts = pd.Timestamp(ts, tz="UTC") if pd.Timestamp(ts).tzinfo is None else pd.Timestamp(ts).tz_convert("UTC")
+        row_df = ml_feat[pd.to_datetime(ml_feat["ts"], utc=True) == target_ts]
+        if row_df.empty:
+            return True, 1.0
+        return self._score_with_row(signal, row_df.iloc[-1].copy(), recent_trades or [])
+
+    def _score_with_row(
+        self,
+        signal: Any,
+        ml_row: pd.Series,
+        recent_trades: List[Any],
+    ) -> Tuple[bool, float]:
+        """Shared scoring path for latest-row and timestamp-aligned modes."""
+        sym = signal.symbol
+        ml_row = patch_signal_features(ml_row, signal, recent_trades)
         feature_values = ml_row[ML_FEATURE_COLS].values.astype(np.float64)
         feature_values = np.nan_to_num(feature_values, nan=0.0)
 
-        prob = float(
-            self.registry.model.predict(feature_values.reshape(1, -1))[0]
-        )
+        prob = float(self.registry.model.predict(feature_values.reshape(1, -1))[0])
         threshold = self.registry.threshold
         passed = prob >= threshold
-
+        signal.ml_score = prob
         log.info(
             f"PhaseB filter: {sym} score={prob:.4f} "
             f"threshold={threshold:.3f} "
             f"{'PASS' if passed else 'SKIP'}"
         )
-
         return passed, prob
 
 

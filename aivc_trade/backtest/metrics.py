@@ -302,6 +302,8 @@ def print_report(metrics: Dict[str, Any]) -> None:
     print(f"  Losing Streak   : {metrics.get('losing_streak', {})}")
     print(f"  MAE/MFE(outcome): {metrics.get('mae_mfe_by_outcome', {})}")
     print(f"  Fees            : {metrics.get('fees', {})}")
+    if "regime_halts" in metrics:
+        print(f"  Regime Halts    : {metrics.get('regime_halts', 0)}")
     status = "PASS ✓" if metrics["passed"] else "FAIL ✗"
     print(f"  Phase A Status  : {status}")
     print("=" * 60 + "\n")

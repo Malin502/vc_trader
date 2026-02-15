@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import traceback
+import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
@@ -22,7 +23,8 @@ if __package__ in (None, ""):
 from aivc_trade.config.loader import load_config
 from aivc_trade.core.clock import clock
 from aivc_trade.core.logger import get_logger, setup_logger
-from aivc_trade.core.types import ExitReason, Position, Regime, Side, SystemState
+from aivc_trade.core.types import Direction, ExitReason, Position, Regime, Side, SystemState
+from aivc_trade.core.direction_helpers import directional_pnl
 from aivc_trade.data.binance_client import BinanceClient
 from aivc_trade.data.candles_store import CandlesStore
 from aivc_trade.data.feature_engine import compute_features_1h, compute_features_5m
@@ -98,6 +100,7 @@ def main() -> None:
     state = state_mgr.load()
     position = state.position
     cooldowns: Dict[str, datetime] = {}
+    short_setup_states: Dict[str, Dict[str, Any]] = {}
     if position and position.cooldown_until:
         cooldowns[position.symbol] = position.cooldown_until
     cb.halt_until = state.halt_until
@@ -232,7 +235,7 @@ def main() -> None:
                             position, current_close, current_adx=current_adx, trend_ma=trend_ma_val
                         )
                     ):
-                        partial_ratio = float(cfg.get("partial_tp", {}).get("ratio", 0.5))
+                        partial_ratio = float(pm.get_partial_tp_ratio(position))
                         partial_qty = position.initial_qty * partial_ratio
 
                         # Round qty to lot step
@@ -242,11 +245,11 @@ def main() -> None:
                         )
 
                         if partial_qty > 0:
-                            partial_order = om.create_exit_order(sym, partial_qty, now)
+                            partial_order = om.create_exit_order(sym, partial_qty, now, direction=position.direction)
                             try:
                                 partial_order = broker.execute(partial_order)
                                 partial_price = partial_order.filled_price or current_close
-                                partial_pnl = partial_qty * (partial_price - position.entry_price)
+                                partial_pnl = directional_pnl(position.direction, partial_qty, position.entry_price, partial_price)
 
                                 # Update position state
                                 position.qty -= partial_qty
@@ -275,12 +278,12 @@ def main() -> None:
                         trend_ma=trend_ma_val,
                     )
                     if exit_reason is not None:
-                        # Execute sell
-                        exit_order = om.create_exit_order(sym, position.qty, now)
+                        # Execute exit
+                        exit_order = om.create_exit_order(sym, position.qty, now, direction=position.direction)
                         try:
                             exit_order = broker.execute(exit_order)
                             exit_price = exit_order.filled_price or current_close
-                            pnl = position.qty * (exit_price - position.entry_price)
+                            pnl = directional_pnl(position.direction, position.qty, position.entry_price, exit_price)
 
                             notifier.notify_exit(
                                 sym, position.qty, exit_price, exit_reason.value, pnl
@@ -313,6 +316,7 @@ def main() -> None:
                     feat_1h, feat_5m, cfg, now,
                     current_position=position,
                     cooldowns=cooldowns,
+                    short_setup_states=short_setup_states,
                 )
                 # --- PhaseB: filter signals through ML model ---
                 if signals and entry_filter.enabled:
@@ -354,12 +358,16 @@ def main() -> None:
                                 qty=qty,
                                 entry_price=filled_price,
                                 stop_price=best.stop_price,
+                                direction=best.direction,
                                 initial_stop_price=0.0,
                                 entry_ts=now,
                                 highest_price=filled_price,
                                 lowest_price=filled_price,
                                 atr_at_entry=feat_1h[best.symbol].iloc[-1]["atr"],
                                 initial_qty=qty,
+                                regime_at_entry=best.regime_at_entry,
+                                entry_type=best.entry_type,
+                                entry_filters_passed=best.entry_filters_passed,
                                 bars_since_entry=0,
                             )
                             pm.apply_initial_stop(position, position.atr_at_entry)

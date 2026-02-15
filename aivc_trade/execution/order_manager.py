@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, Optional
 
-from aivc_trade.core.types import Order, OrderType, Side, Signal
+from aivc_trade.core.types import Direction, Order, OrderType, Side, Signal
+from aivc_trade.core.direction_helpers import order_side_for_entry, order_side_for_exit
 from aivc_trade.core.logger import get_logger
 
 log = get_logger("order_manager")
@@ -25,7 +26,7 @@ class OrderManager:
 
         order = Order(
             symbol=signal.symbol,
-            side=Side.BUY,
+            side=order_side_for_entry(signal.direction),
             order_type=otype,
             qty=qty,
             price=signal.entry_price if otype == OrderType.LIMIT else None,
@@ -38,14 +39,18 @@ class OrderManager:
         return order
 
     def create_exit_order(
-        self, symbol: str, qty: float, now: datetime
+        self,
+        symbol: str,
+        qty: float,
+        now: datetime,
+        direction: Direction = Direction.LONG,
     ) -> Order:
         order = Order(
             symbol=symbol,
-            side=Side.SELL,
+            side=order_side_for_exit(direction),
             order_type=OrderType.MARKET,
             qty=qty,
             ts=now,
         )
-        log.info(f"Exit order: {order.symbol} SELL qty={order.qty}")
+        log.info(f"Exit order: {order.symbol} {order.side.value} qty={order.qty}")
         return order

@@ -18,6 +18,7 @@ def compute_features_1h(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
     Expected input columns: ts, open, high, low, close, volume.
     """
     p = cfg["indicators_1h"]
+    trend_cfg = cfg.get("trend_filter", {})
 
     df = df.copy()
 
@@ -47,6 +48,10 @@ def compute_features_1h(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
         df["trend_ma"] = ind.ema(df["close"], trend_ma_period)
     else:
         df["trend_ma"] = ind.sma(df["close"], trend_ma_period)
+    df["trend_ma_slope"] = ind.ema_slope(
+        df["trend_ma"],
+        int(cfg.get("short", {}).get("regime", {}).get("ema_slope_lookback", 24)),
+    )
 
     # Breakout high for strict breakout trigger
     breakout_cfg = cfg.get("entry_signal", {}).get("breakout", {})
@@ -56,8 +61,24 @@ def compute_features_1h(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
     # Volume SMA
     df["volume_sma"] = ind.sma(df["volume"], p["volume_sma_period"])
 
-    # Structure – recent swing low
+    # Structure – recent swing low / high
     df["recent_swing_low"] = df["low"].rolling(p["swing_low_period"]).min()
+    df["recent_swing_high"] = df["high"].rolling(p["swing_low_period"]).max()
+    # Confirmed swing high (pivot at t-2): high[i] > high[i-1,i-2,i+1,i+2]
+    pivot_high = (
+        (df["high"].shift(2) > df["high"].shift(3))
+        & (df["high"].shift(2) > df["high"].shift(4))
+        & (df["high"].shift(2) > df["high"].shift(1))
+        & (df["high"].shift(2) > df["high"])
+    )
+    df["swing_high_confirmed"] = df["high"].shift(2).where(pivot_high)
+    df["last_swing_high"] = df["swing_high_confirmed"].ffill()
+
+    # Donchian low prev (for SHORT breakdown)
+    df["donchian_low_prev"] = df["donchian_low"].shift(1)
+
+    # Breakout low for strict breakdown trigger
+    df["breakout_low_prev"] = df["low"].rolling(breakout_lookback).min().shift(1)
 
     # Max drop 6h (for CHAOS detection)
     chaos_lb = cfg["regime"]["chaos_drop_lookback"]
@@ -72,6 +93,16 @@ def compute_features_1h(df: pd.DataFrame, cfg: Dict[str, Any]) -> pd.DataFrame:
     # ema_slow_slope: slope of slow EMA for TREND_UP verification
     slope_bars = p.get("ema_slope_lookback", 8)
     df["ema_slow_slope"] = ind.ema_slope(df["ema_slow"], slope_bars)
+
+    # Trend filter features (1h EMA slope % + ADX)
+    tf_ema_period = int(trend_cfg.get("ema_period", 50))
+    tf_slope_lb = int(trend_cfg.get("slope_lookback", 8))
+    tf_adx_period = int(trend_cfg.get("adx_period", 14))
+    eps = 1e-10
+    df["ema_50"] = ind.ema(df["close"], tf_ema_period)
+    ema_prev = df["ema_50"].shift(tf_slope_lb)
+    df["ema_50_slope_pct"] = ((df["ema_50"] - ema_prev) / (ema_prev + eps)) * 100.0
+    df["adx_14"] = ind.adx(df["high"], df["low"], df["close"], tf_adx_period)
 
     return df
 

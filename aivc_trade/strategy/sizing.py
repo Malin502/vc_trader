@@ -6,6 +6,7 @@ import math
 from typing import Any, Dict
 
 from aivc_trade.core.types import Signal
+from aivc_trade.core.direction_helpers import stop_distance
 from aivc_trade.core.logger import get_logger
 
 log = get_logger("sizing")
@@ -25,6 +26,7 @@ def compute_qty(
     cfg: Dict[str, Any],
     lot_step: float = 0.00001,
     min_qty: float = 0.0,
+    risk_multiplier: float = 1.0,
 ) -> float:
     """Compute order quantity respecting the 5% risk limit.
 
@@ -40,8 +42,8 @@ def compute_qty(
     -------
     Rounded quantity (0.0 if invalid / too small).
     """
-    risk_per_trade = equity * cfg["sizing"]["risk_per_trade"]
-    stop_dist = signal.entry_price - signal.stop_price
+    risk_per_trade = equity * cfg["sizing"]["risk_per_trade"] * max(risk_multiplier, 0.0)
+    stop_dist = stop_distance(signal.direction, signal.entry_price, signal.stop_price)
 
     if stop_dist <= 0:
         log.warning("stop_dist <= 0 – cannot size")

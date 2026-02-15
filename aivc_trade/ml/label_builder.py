@@ -12,6 +12,48 @@ from aivc_trade.core.logger import get_logger
 log = get_logger("ml_label_builder")
 
 
+def build_labels(
+    df: pd.DataFrame,
+    horizon: int,
+    entry_price_col: str | None = None,
+) -> pd.DataFrame:
+    """Build quantile-regression targets for long/short screening.
+
+    Added columns:
+      - y_long_up
+      - y_long_down
+      - y_short_up
+      - y_short_down
+    """
+    out = df.copy()
+    close = out["close"].astype(float)
+
+    future_max = close.shift(-1).rolling(window=horizon, min_periods=horizon).max().shift(
+        -(horizon - 1)
+    )
+    future_min = close.shift(-1).rolling(window=horizon, min_periods=horizon).min().shift(
+        -(horizon - 1)
+    )
+
+    if entry_price_col and entry_price_col in out.columns:
+        entry_price = out[entry_price_col].astype(float).where(
+            out[entry_price_col].astype(float) > 0.0,
+            np.nan,
+        )
+        entry_price = entry_price.fillna(close)
+    else:
+        entry_price = close
+    entry_price = entry_price.replace(0.0, np.nan)
+    future_max_ret_h = (future_max - entry_price) / entry_price
+    future_min_ret_h = (future_min - entry_price) / entry_price
+
+    out["y_long_up"] = future_max_ret_h
+    out["y_long_down"] = -future_min_ret_h
+    out["y_short_up"] = -future_min_ret_h
+    out["y_short_down"] = future_max_ret_h
+    return out
+
+
 def compute_labels(
     df: pd.DataFrame,
     horizon_bars: int = 24,

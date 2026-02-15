@@ -12,7 +12,7 @@ import pandas as pd
 import lightgbm as lgb
 
 from aivc_trade.core.logger import get_logger
-from aivc_trade.core.types import ExitReason, Position, Regime, Side, TradeRecord
+from aivc_trade.core.types import Direction, ExitReason, Position, Regime, Side, TradeRecord
 from aivc_trade.execution.position_manager import PositionManager
 from aivc_trade.ml.feature_builder import ML_FEATURE_COLS, compute_ml_features
 from aivc_trade.ml.feature_builder import patch_signal_features
@@ -213,6 +213,9 @@ def _inject_phasea_signal_context(
     ml_feat = compute_ml_features(feat_df, cfg)
     if feat_df.empty or ml_feat.empty:
         return ml_feat
+    ml_feat["phaseA_long_signal"] = 0
+    ml_feat["phaseA_short_signal"] = 0
+    ml_feat["phaseA_entry_price"] = np.nan
 
     pm = PositionManager(cfg)
     cooldown_bars = int(cfg.get("entry", {}).get("cooldown_bars", 8))
@@ -224,6 +227,7 @@ def _inject_phasea_signal_context(
 
     position: Position | None = None
     cooldowns_bar: Dict[str, int] = {}
+    short_setup_states: Dict[str, Dict[str, Any]] = {}
     loss_streak: Dict[str, int] = {}
     trades: List[TradeRecord] = []
     signal_count = 0
@@ -301,10 +305,15 @@ def _inject_phasea_signal_context(
                 current_position=None,
                 cooldowns_bar=cooldowns_bar,
                 current_bar_idx=i,
+                short_setup_states=short_setup_states,
             )
             if sigs:
                 sig = sigs[0]
                 signal_count += 1
+                if sig.direction == Direction.LONG:
+                    ml_feat.loc[i, "phaseA_long_signal"] = 1
+                elif sig.direction == Direction.SHORT:
+                    ml_feat.loc[i, "phaseA_short_signal"] = 1
 
                 ml_row = patch_signal_features(ml_feat.iloc[i], sig, trades)
                 ml_feat.loc[i, "entry_type_id"] = float(ml_row["entry_type_id"])
@@ -315,6 +324,7 @@ def _inject_phasea_signal_context(
                 entry_price = _get_next_bar_open(feat_df, ts)
                 if entry_price is None:
                     entry_price = float(sig.entry_price)
+                ml_feat.loc[i, "phaseA_entry_price"] = float(entry_price)
                 stop_price = float(sig.stop_price)
                 if stop_price >= entry_price:
                     stop_price = float(entry_price) * 0.95
@@ -332,10 +342,16 @@ def _inject_phasea_signal_context(
                     planned_risk=max(float(entry_price) - stop_price, 0.0),
                     initial_qty=1.0,
                     regime_at_entry=(
-                        row["regime"].value
-                        if isinstance(row.get("regime"), Regime)
-                        else str(row.get("regime", "RANGE"))
+                        sig.regime_at_entry
+                        if sig.regime_at_entry
+                        else (
+                            row["regime"].value
+                            if isinstance(row.get("regime"), Regime)
+                            else str(row.get("regime", "RANGE"))
+                        )
                     ),
+                    entry_type=sig.entry_type,
+                    entry_filters_passed=sig.entry_filters_passed,
                     mode="CORE",
                 )
                 pm.apply_initial_stop(position, atr_at_entry)

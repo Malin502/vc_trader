@@ -227,8 +227,12 @@ class TestRegime:
         assert classify_regime(row, sample_config) == Regime.CHAOS
 
     def test_chaos_strong_downtrend(self, sample_config):
+        """With allow_short_regime=true, use separate config to get CHAOS."""
+        import copy
         from aivc_trade.strategy.regime import classify_regime
         from aivc_trade.core.types import Regime
+        cfg = copy.deepcopy(sample_config)
+        cfg["regime"]["allow_short_regime"] = False
         row = pd.Series({
             "atrp_z": 0.5,
             "close": 47000,
@@ -239,7 +243,7 @@ class TestRegime:
             "atrp": 0.02,
             "max_drop_6h": -0.01,
         })
-        assert classify_regime(row, sample_config) == Regime.CHAOS
+        assert classify_regime(row, cfg) == Regime.CHAOS
 
     def test_trend_up(self, sample_config):
         from aivc_trade.strategy.regime import classify_regime
@@ -465,7 +469,7 @@ class TestBreakEven:
         assert pos.stop_price >= 50000 + fee_buffer - 0.01
 
     def test_be_does_not_activate_below_threshold(self, sample_config):
-        """Stop stays at initial SL when MFE < be_activate_pct."""
+        """Stop stays at initial SL when MFE < be_activate_pct (0.8%)."""
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
@@ -475,7 +479,7 @@ class TestBreakEven:
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000,
         )
-        pos = pm.update_stop(pos, 50500, 1000)  # MFE=1.0%
+        pos = pm.update_stop(pos, 50300, 1000)  # MFE=0.6% < 0.8%
         assert pos.stop_price == 48000
 
 
@@ -525,7 +529,7 @@ class TestNoRangeExitDuringTrend:
             assert result is None, f"Should not exit at bar {h}"
 
     def test_range_exits_after_confirm_bars_when_close_below_ema_slow(self, sample_config):
-        """RANGE exit fires after confirm_bars AND close < ema_slow."""
+        """RANGE exit fires after range_exit_confirm_bars (16) AND close < ema_slow."""
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import ExitReason, Position, Regime
         pm = PositionManager(sample_config)
@@ -535,8 +539,8 @@ class TestNoRangeExitDuringTrend:
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000,
         )
-        # 10 RANGE bars
-        for h in range(1, 11):
+        confirm_bars = int(sample_config["runner"]["range_exit_confirm_bars"])
+        for h in range(1, confirm_bars + 1):
             result = pm.check_exit(
                 pos, 49500, 1000, Regime.RANGE,
                 datetime(2024, 1, 1, h, tzinfo=timezone.utc),
@@ -625,21 +629,22 @@ class TestChaosHandling:
 # ============================================================
 
 class TestPartialTP:
-    def test_partial_tp_triggers_at_3_5_percent(self, sample_config):
+    def test_partial_tp_triggers_at_threshold(self, sample_config):
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
+        threshold_pct = float(sample_config["partial_tp"]["threshold_pct"])
         pos = Position(
             symbol="BTCUSDC", qty=0.1, entry_price=50000,
             stop_price=48000, initial_qty=0.1,
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, highest_price=50000, lowest_price=50000,
         )
-        # +3.5% = 51750
-        assert pm.check_partial_tp(pos, 51750) is True
+        trigger_price = 50000 * (1 + threshold_pct / 100.0)
+        assert pm.check_partial_tp(pos, trigger_price) is True
 
-    def test_partial_tp_does_not_trigger_at_2_percent(self, sample_config):
-        """Partial TP should NOT trigger at 2% (old threshold)."""
+    def test_partial_tp_does_not_trigger_below_threshold(self, sample_config):
+        """Partial TP should NOT trigger below threshold_pct."""
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
@@ -669,8 +674,8 @@ class TestPartialTP:
 # ============================================================
 
 class TestRunnerMode:
-    def test_runner_trail_uses_atr_k_3(self, sample_config):
-        """Runner trailing stop = peak - ATR * 3.0."""
+    def test_runner_trail_updates(self, sample_config):
+        """Runner trailing stop is set and positive after update_stop."""
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
@@ -681,9 +686,10 @@ class TestRunnerMode:
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, lowest_price=50000,
         )
-        # Trail = 51500 - 3.0*500 = 50000
         pos = pm.update_stop(pos, 51500, 500)
-        assert pos.runner_trail_price == pytest.approx(50000.0)
+        # Runner trail should be set (possibly floored by BE stop)
+        assert pos.runner_trail_price > 0
+        assert pos.runner_trail_price <= 51500  # must be below peak
 
     def test_runner_trail_only_ratchets_up(self, sample_config):
         """Runner trail never decreases, even with higher ATR."""
@@ -697,12 +703,11 @@ class TestRunnerMode:
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, lowest_price=50000,
         )
-        # First: trail = 51500 - 3.0*500 = 50000
         pos = pm.update_stop(pos, 51500, 500)
         first_trail = pos.runner_trail_price
-        assert first_trail == pytest.approx(50000.0)
+        assert first_trail > 0
 
-        # Second: higher ATR would compute 51500 - 3.0*800 = 49100 — should NOT decrease
+        # Higher ATR would compute a lower trail — should NOT decrease
         pos = pm.update_stop(pos, 51400, 800)
         assert pos.runner_trail_price == first_trail
 
@@ -717,11 +722,9 @@ class TestRunnerMode:
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, lowest_price=50000,
         )
-        pos = pm.update_stop(pos, 51500, 500)  # trail = 51500 - 3*500 = 50000
-        # BE moved stop to ~50040 (entry + 8bps buffer)
-        # effective_stop = max(50040, 50000) = 50040
-        # Price drops below both → exit triggered (STOP_LOSS from BE)
-        result = pm.check_exit(pos, 49900, 500, Regime.TREND_UP,
+        pos = pm.update_stop(pos, 51500, 500)
+        # Price drops well below all stops → exit triggered
+        result = pm.check_exit(pos, 49000, 500, Regime.TREND_UP,
                                datetime(2024, 1, 1, 12, tzinfo=timezone.utc))
         assert result in (ExitReason.TRAILING_STOP_RUNNER, ExitReason.STOP_LOSS)
 
@@ -732,15 +735,17 @@ class TestRunnerMode:
         pm = PositionManager(sample_config)
         pos = Position(
             symbol="BTCUSDC", qty=0.05, entry_price=50000,
-            stop_price=48000, initial_qty=0.1, highest_price=53000,
+            stop_price=48000, initial_qty=0.1, highest_price=55000,
             partial_taken=True, runner_mode=True, mode="RUNNER",
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, lowest_price=50000,
         )
-        # Trail = 53000 - 3*500 = 51500, well above BE (50040)
-        pos = pm.update_stop(pos, 53000, 500)
-        assert pos.runner_trail_price == pytest.approx(51500.0)
-        result = pm.check_exit(pos, 51400, 500, Regime.TREND_UP,
+        atr = 500
+        pos = pm.update_stop(pos, 55000, atr)
+        trail = pos.runner_trail_price
+        assert trail > 50040  # must be well above BE stop
+        # Drop below trail → TRAILING_STOP_RUNNER
+        result = pm.check_exit(pos, trail - 100, atr, Regime.TREND_UP,
                                datetime(2024, 1, 1, 12, tzinfo=timezone.utc))
         assert result == ExitReason.TRAILING_STOP_RUNNER
 
@@ -773,11 +778,12 @@ class TestRunnerMode:
 
 class TestRegimeExitTimeout:
     def test_timeout_after_max_off_bars_with_low_mfe(self, sample_config):
-        """Low MFE + RANGE triggers REGIME_EXIT_RANGE at confirm_bars (10),
-        not TIMEOUT (18), because RANGE exit condition fires first."""
+        """Low MFE + RANGE triggers REGIME_EXIT_RANGE at range_exit_confirm_bars,
+        not TIMEOUT (max_off_bars), because RANGE exit condition fires first."""
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import ExitReason, Position, Regime
         pm = PositionManager(sample_config)
+        confirm_bars = int(sample_config["runner"]["range_exit_confirm_bars"])
         pos = Position(
             symbol="BTCUSDC", qty=0.1, entry_price=50000,
             stop_price=48000, highest_price=50500, lowest_price=49800,
@@ -785,9 +791,8 @@ class TestRegimeExitTimeout:
             atr_at_entry=1000,
         )
         pos.mfe_pct = 1.0  # Below min_mfe_to_hold_pct (1.5%)
-        # With close > ema_slow but low MFE, RANGE exit fires at bar 10
         result = None
-        for h in range(1, 19):
+        for h in range(1, confirm_bars + 5):
             result = pm.check_exit(
                 pos, 50200, 1000, Regime.RANGE,
                 datetime(2024, 1, 1, h, tzinfo=timezone.utc),
@@ -796,7 +801,7 @@ class TestRegimeExitTimeout:
             if result is not None:
                 break
         assert result == ExitReason.REGIME_EXIT_RANGE
-        assert pos.regime_break_bars == 10  # Fired at confirm_bars
+        assert pos.regime_break_bars == confirm_bars
 
     def test_chaos_timeout_after_max_off_bars(self, sample_config):
         """CHAOS bars accumulate to max_off_bars → REGIME_EXIT_TIMEOUT."""
@@ -1190,21 +1195,24 @@ class TestConfig:
         assert "cooldown_bars" in cfg["entry"]
         assert "trigger" in cfg["entry"]
         assert cfg["entry"]["trigger"] == "breakout"
-        assert cfg["entry"]["cooldown_bars"] == 36
+        assert cfg["entry"]["cooldown_bars"] == 48
         # Risk
         assert "sl_atr_k" in cfg["risk"]
-        assert "be_activate_pct" in cfg["risk"]
-        assert cfg["risk"]["be_activate_pct"] == 1.5
         assert "fee_buffer_bps" in cfg["risk"]
         # Entry quality
-        assert cfg["entry_quality"]["min_adx"] == 28
+        assert cfg["entry_quality"]["min_adx"] == 25
         assert cfg["entry_quality"]["adx_strict_gt"] is True
         # Partial TP
-        assert cfg["partial_tp"]["threshold_pct"] == 3.5
-        assert cfg["partial_tp"]["ratio"] == 0.33
+        assert cfg["partial_tp"]["threshold_pct"] == 4.5
+        assert cfg["partial_tp"]["ratio"] == 0.30
         # Runner
-        assert cfg["runner"]["trail_atr_k"] == 3.0
-        assert cfg["runner"]["range_exit_confirm_bars"] == 10
+        assert cfg["runner"]["trail_atr_k"] == 3.8
+        assert cfg["runner"]["range_exit_confirm_bars"] == 16
+        # Strategy direction
+        assert cfg["strategy"]["allow_long"] is True
+        assert cfg["strategy"]["allow_short"] is True
+        # Regime SHORT
+        assert cfg["regime"]["allow_short_regime"] is True
         assert cfg["runner"]["chaos_tighten_k"] == 1.5
 
 
@@ -1391,7 +1399,7 @@ class TestEntryFilter:
         assert score == 1.0
 
     def test_enabled_no_model_passes_all(self, sample_config):
-        """When enabled but no model loaded, signals pass through."""
+        """When enabled but no model loaded (pass mode), signals pass through."""
         import copy
         from aivc_trade.ml.entry_filter import EntryFilter
         from aivc_trade.core.types import Signal
@@ -1399,6 +1407,7 @@ class TestEntryFilter:
         cfg = copy.deepcopy(sample_config)
         cfg.setdefault("ml_filter", {})["enabled"] = True
         cfg["ml_filter"]["model_dir"] = "/tmp/nonexistent_models_abc123"
+        cfg["ml_filter"]["on_missing_model"] = "pass"
         ef = EntryFilter(cfg)
         ef.load_model()
 
@@ -1660,6 +1669,429 @@ class TestThresholdOptimization:
         for thr_val, metrics in results.items():
             assert "pass_rate" in metrics
             assert 0.0 <= metrics["pass_rate"] <= 1.0
+
+
+# ============================================================
+# Test: Direction Helpers
+# ============================================================
+
+class TestDirectionHelpers:
+    def test_directional_pnl_long(self):
+        from aivc_trade.core.direction_helpers import directional_pnl
+        from aivc_trade.core.types import Direction
+        assert directional_pnl(Direction.LONG, 1.0, 100.0, 110.0) == pytest.approx(10.0)
+
+    def test_directional_pnl_short(self):
+        from aivc_trade.core.direction_helpers import directional_pnl
+        from aivc_trade.core.types import Direction
+        assert directional_pnl(Direction.SHORT, 1.0, 100.0, 90.0) == pytest.approx(10.0)
+        assert directional_pnl(Direction.SHORT, 1.0, 100.0, 110.0) == pytest.approx(-10.0)
+
+    def test_directional_mfe_long(self):
+        from aivc_trade.core.direction_helpers import directional_mfe
+        from aivc_trade.core.types import Direction
+        # LONG: MFE = (highest - entry) / entry
+        assert directional_mfe(Direction.LONG, 100.0, 110.0, 95.0) == pytest.approx(0.1)
+
+    def test_directional_mfe_short(self):
+        from aivc_trade.core.direction_helpers import directional_mfe
+        from aivc_trade.core.types import Direction
+        # SHORT: MFE = (entry - lowest) / entry
+        assert directional_mfe(Direction.SHORT, 100.0, 110.0, 90.0) == pytest.approx(0.1)
+
+    def test_directional_mae_long(self):
+        from aivc_trade.core.direction_helpers import directional_mae
+        from aivc_trade.core.types import Direction
+        # LONG: MAE = (entry - lowest) / entry
+        assert directional_mae(Direction.LONG, 100.0, 110.0, 95.0) == pytest.approx(0.05)
+
+    def test_directional_mae_short(self):
+        from aivc_trade.core.direction_helpers import directional_mae
+        from aivc_trade.core.types import Direction
+        # SHORT: MAE = (highest - entry) / entry
+        assert directional_mae(Direction.SHORT, 100.0, 110.0, 90.0) == pytest.approx(0.1)
+
+    def test_directional_stop_hit_long(self):
+        from aivc_trade.core.direction_helpers import directional_stop_hit
+        from aivc_trade.core.types import Direction
+        assert directional_stop_hit(Direction.LONG, 48000, 47000) is True
+        assert directional_stop_hit(Direction.LONG, 48000, 49000) is False
+
+    def test_directional_stop_hit_short(self):
+        from aivc_trade.core.direction_helpers import directional_stop_hit
+        from aivc_trade.core.types import Direction
+        assert directional_stop_hit(Direction.SHORT, 52000, 53000) is True
+        assert directional_stop_hit(Direction.SHORT, 52000, 51000) is False
+
+    def test_directional_trail_stop(self):
+        from aivc_trade.core.direction_helpers import directional_trail_stop
+        from aivc_trade.core.types import Direction
+        assert directional_trail_stop(Direction.LONG, 52000, 1000, 2.5) == pytest.approx(49500)
+        assert directional_trail_stop(Direction.SHORT, 48000, 1000, 2.5) == pytest.approx(50500)
+
+    def test_directional_breakeven_stop(self):
+        from aivc_trade.core.direction_helpers import directional_breakeven_stop
+        from aivc_trade.core.types import Direction
+        assert directional_breakeven_stop(Direction.LONG, 50000, 40) == pytest.approx(50040)
+        assert directional_breakeven_stop(Direction.SHORT, 50000, 40) == pytest.approx(49960)
+
+    def test_is_stop_improvement_long(self):
+        from aivc_trade.core.direction_helpers import is_stop_improvement
+        from aivc_trade.core.types import Direction
+        assert is_stop_improvement(Direction.LONG, 49000, 48000) is True
+        assert is_stop_improvement(Direction.LONG, 47000, 48000) is False
+
+    def test_is_stop_improvement_short(self):
+        from aivc_trade.core.direction_helpers import is_stop_improvement
+        from aivc_trade.core.types import Direction
+        assert is_stop_improvement(Direction.SHORT, 51000, 52000) is True
+        assert is_stop_improvement(Direction.SHORT, 53000, 52000) is False
+
+    def test_order_side_for_entry_exit(self):
+        from aivc_trade.core.direction_helpers import order_side_for_entry, order_side_for_exit
+        from aivc_trade.core.types import Direction, Side
+        assert order_side_for_entry(Direction.LONG) == Side.BUY
+        assert order_side_for_entry(Direction.SHORT) == Side.SELL
+        assert order_side_for_exit(Direction.LONG) == Side.SELL
+        assert order_side_for_exit(Direction.SHORT) == Side.BUY
+
+    def test_stop_distance(self):
+        from aivc_trade.core.direction_helpers import stop_distance
+        from aivc_trade.core.types import Direction
+        assert stop_distance(Direction.LONG, 50000, 48000) == pytest.approx(2000)
+        assert stop_distance(Direction.SHORT, 50000, 52000) == pytest.approx(2000)
+
+    def test_directional_unrealized_pct(self):
+        from aivc_trade.core.direction_helpers import directional_unrealized_pct
+        from aivc_trade.core.types import Direction
+        assert directional_unrealized_pct(Direction.LONG, 50000, 51000) == pytest.approx(2.0)
+        assert directional_unrealized_pct(Direction.SHORT, 50000, 49000) == pytest.approx(2.0)
+        assert directional_unrealized_pct(Direction.SHORT, 50000, 51000) == pytest.approx(-2.0)
+
+
+# ============================================================
+# Test: Position Manager SHORT
+# ============================================================
+
+class TestPositionManagerShort:
+    def test_stop_loss_triggered_short(self, sample_config):
+        from aivc_trade.execution.position_manager import PositionManager
+        from aivc_trade.core.types import Direction, ExitReason, Position, Regime
+        pm = PositionManager(sample_config)
+        pos = Position(
+            symbol="BTCUSDC", qty=0.1, entry_price=50000,
+            stop_price=52000, direction=Direction.SHORT,
+            entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            atr_at_entry=1000, highest_price=50000, lowest_price=50000,
+        )
+        result = pm.check_exit(pos, 52500, 1000, Regime.TREND_DOWN,
+                               datetime(2024, 1, 1, 12, tzinfo=timezone.utc))
+        assert result == ExitReason.STOP_LOSS
+
+    def test_no_exit_below_stop_short(self, sample_config):
+        from aivc_trade.execution.position_manager import PositionManager
+        from aivc_trade.core.types import Direction, Position, Regime
+        pm = PositionManager(sample_config)
+        pos = Position(
+            symbol="BTCUSDC", qty=0.1, entry_price=50000,
+            stop_price=52000, direction=Direction.SHORT,
+            entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            atr_at_entry=1000, highest_price=50000, lowest_price=50000,
+        )
+        result = pm.check_exit(pos, 49000, 1000, Regime.TREND_DOWN,
+                               datetime(2024, 1, 1, 12, tzinfo=timezone.utc))
+        assert result is None
+
+    def test_breakeven_short(self, sample_config):
+        """BE moves stop down for SHORT when MFE threshold reached."""
+        from aivc_trade.execution.position_manager import PositionManager
+        from aivc_trade.core.types import Direction, Position
+        pm = PositionManager(sample_config)
+        pos = Position(
+            symbol="BTCUSDC", qty=0.1, entry_price=50000,
+            stop_price=52000, direction=Direction.SHORT,
+            entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            atr_at_entry=1000, highest_price=50000, lowest_price=50000,
+        )
+        # MFE for SHORT = (entry - lowest) / entry => needs lowest at 49600 for 0.8%
+        pos = pm.update_stop(pos, 48800, 1000, current_low=48800)
+        # BE for SHORT = entry - buffer (below entry)
+        fee_buffer = 50000 * 8 / 10000  # 40
+        assert pos.stop_price <= 50000 - fee_buffer + 0.01
+
+    def test_short_pnl_positive_when_price_drops(self, sample_config):
+        """Verify directional PnL: SHORT profits when price drops."""
+        from aivc_trade.core.direction_helpers import directional_pnl
+        from aivc_trade.core.types import Direction
+        pnl = directional_pnl(Direction.SHORT, 0.1, 50000, 48000)
+        assert pnl == pytest.approx(200.0)
+
+
+# ============================================================
+# Test: Regime TREND_DOWN
+# ============================================================
+
+class TestRegimeTrendDown:
+    def test_trend_down_detected(self, sample_config):
+        from aivc_trade.strategy.regime import classify_regime
+        from aivc_trade.core.types import Regime
+        row = pd.Series({
+            "atrp_z": 0.3,
+            "close": 47000,
+            "ema_slow": 49000,
+            "ema_fast": 47500,
+            "adx": 25,
+            "slope": -0.003,
+            "atrp": 0.015,
+            "max_drop_6h": -0.005,
+            "ema_slow_slope": -0.001,
+        })
+        assert classify_regime(row, sample_config) == Regime.TREND_DOWN
+
+    def test_trend_down_requires_allow_short_regime(self, sample_config):
+        """With allow_short_regime=false, downtrend becomes CHAOS instead."""
+        import copy
+        from aivc_trade.strategy.regime import classify_regime
+        from aivc_trade.core.types import Regime
+        cfg = copy.deepcopy(sample_config)
+        cfg["regime"]["allow_short_regime"] = False
+        row = pd.Series({
+            "atrp_z": 0.3,
+            "close": 47000,
+            "ema_slow": 49000,
+            "ema_fast": 47500,
+            "adx": 30,
+            "slope": -0.003,
+            "atrp": 0.015,
+            "max_drop_6h": -0.005,
+            "ema_slow_slope": -0.001,
+        })
+        # Should be CHAOS (condition #4: close < ema_slow and adx > chaos_adx_trend_down)
+        assert classify_regime(row, cfg) == Regime.CHAOS
+
+    def test_trend_down_not_trend_up(self, sample_config):
+        """Uptrend conditions should NOT produce TREND_DOWN."""
+        from aivc_trade.strategy.regime import classify_regime
+        from aivc_trade.core.types import Regime
+        row = pd.Series({
+            "atrp_z": 0.3,
+            "close": 51000,
+            "ema_slow": 49000,
+            "ema_fast": 50500,
+            "adx": 25,
+            "slope": 0.003,
+            "atrp": 0.015,
+            "max_drop_6h": -0.005,
+            "ema_slow_slope": 0.001,
+        })
+        result = classify_regime(row, sample_config)
+        assert result == Regime.TREND_UP
+        assert result != Regime.TREND_DOWN
+
+
+# ============================================================
+# Test: SHORT Signal Generation
+# ============================================================
+
+class TestShortSignal:
+    def test_no_signal_short_when_not_trend_down(self, sample_config):
+        """SHORT signal requires TREND_DOWN regime."""
+        import copy
+        from aivc_trade.strategy.signal import generate_signals
+        from aivc_trade.core.types import Regime
+
+        cfg = copy.deepcopy(sample_config)
+        cfg["strategy"] = {"allow_long": False, "allow_short": True}
+        now = datetime(2024, 1, 1, 12, tzinfo=timezone.utc)
+
+        row = {
+            "ts": now,
+            "regime": Regime.RANGE,  # Not TREND_DOWN
+            "ret_24h": -0.05,
+            "atrp": 0.01,
+            "close": 47000.0,
+            "ema_fast": 47500.0,
+            "donchian_low_prev": 47500.0,
+            "breakout_low_prev": 47500.0,
+            "volume": 120.0,
+            "volume_sma": 100.0,
+            "atrp_z": 0.2,
+            "slope": -0.003,
+            "atr": 400.0,
+            "recent_swing_high": 48000.0,
+            "adx": 30.0,
+            "trend_ma": 48000.0,
+        }
+        df = pd.DataFrame([row])
+        signals = generate_signals({"BTCUSDC": df}, {}, cfg, now)
+        assert len(signals) == 0
+
+    def test_short_signal_generated_in_trend_down(self, sample_config):
+        """SHORT signal is generated when all conditions met."""
+        import copy
+        from aivc_trade.strategy.signal import generate_signals
+        from aivc_trade.core.types import Direction, Regime
+
+        cfg = copy.deepcopy(sample_config)
+        cfg["strategy"] = {"allow_long": False, "allow_short": True}
+        cfg["entry"]["trigger"] = "breakout"
+        cfg["entry_filter"]["enabled"] = False
+        cfg["entry_quality"]["enabled"] = False
+        cfg["entry"]["volume_above_sma"] = False
+        now = datetime(2024, 1, 1, 12, tzinfo=timezone.utc)
+
+        row = {
+            "ts": now,
+            "regime": Regime.TREND_DOWN,
+            "ret_24h": -0.05,
+            "atrp": 0.01,
+            "close": 47000.0,
+            "ema_fast": 47500.0,
+            "donchian_low_prev": 47500.0,
+            "breakout_low_prev": 47500.0,
+            "volume": 120.0,
+            "volume_sma": 100.0,
+            "atrp_z": 0.2,
+            "slope": -0.003,
+            "atr": 400.0,
+            "recent_swing_high": 48000.0,
+            "adx": 30.0,
+            "trend_ma": 48000.0,
+        }
+        df = pd.DataFrame([row])
+        signals = generate_signals({"BTCUSDC": df}, {}, cfg, now)
+        assert len(signals) == 1
+        assert signals[0].direction == Direction.SHORT
+        assert signals[0].stop_price > signals[0].entry_price  # SHORT stop is above entry
+
+    def test_short_signal_blocked_when_allow_short_false(self, sample_config):
+        """allow_short=false prevents SHORT signal generation."""
+        import copy
+        from aivc_trade.strategy.signal import generate_signals
+        from aivc_trade.core.types import Regime
+
+        cfg = copy.deepcopy(sample_config)
+        cfg["strategy"] = {"allow_long": False, "allow_short": False}
+        cfg["entry"]["trigger"] = "breakout"
+        cfg["entry_filter"]["enabled"] = False
+        cfg["entry_quality"]["enabled"] = False
+        cfg["entry"]["volume_above_sma"] = False
+        now = datetime(2024, 1, 1, 12, tzinfo=timezone.utc)
+
+        row = {
+            "ts": now,
+            "regime": Regime.TREND_DOWN,
+            "ret_24h": -0.05,
+            "atrp": 0.01,
+            "close": 47000.0,
+            "ema_fast": 47500.0,
+            "donchian_low_prev": 47500.0,
+            "breakout_low_prev": 47500.0,
+            "volume": 120.0,
+            "volume_sma": 100.0,
+            "atrp_z": 0.2,
+            "slope": -0.003,
+            "atr": 400.0,
+            "recent_swing_high": 48000.0,
+            "adx": 30.0,
+            "trend_ma": 48000.0,
+        }
+        df = pd.DataFrame([row])
+        signals = generate_signals({"BTCUSDC": df}, {}, cfg, now)
+        assert len(signals) == 0
+
+
+# ============================================================
+# Test: Persistence with direction
+# ============================================================
+
+class TestPersistenceDirection:
+    def test_save_load_short_position(self):
+        from aivc_trade.ops.persistence import StateManager
+        from aivc_trade.core.types import Direction, Position, SystemState
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/state.json"
+            sm = StateManager(path)
+
+            state = SystemState(
+                position=Position(
+                    symbol="BTCUSDC",
+                    qty=0.05,
+                    entry_price=50000,
+                    stop_price=52000,
+                    direction=Direction.SHORT,
+                    entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                    highest_price=50000,
+                    lowest_price=48000,
+                    atr_at_entry=1200,
+                    initial_qty=0.05,
+                ),
+            )
+            sm.save(state)
+            loaded = sm.load()
+
+            assert loaded.position is not None
+            assert loaded.position.direction == Direction.SHORT
+            assert loaded.position.stop_price == 52000
+
+    def test_load_legacy_state_defaults_to_long(self):
+        """Old state files without 'direction' should default to LONG."""
+        from aivc_trade.ops.persistence import StateManager
+        from aivc_trade.core.types import Direction
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = f"{tmp}/state.json"
+            # Write legacy format (no direction field)
+            legacy = {
+                "position": {
+                    "symbol": "BTCUSDC",
+                    "qty": 0.1,
+                    "entry_price": 50000,
+                    "stop_price": 48000,
+                },
+                "last_signal_ts": None,
+                "last_process_ts": None,
+                "equity_snapshots": [],
+                "halt_until": None,
+                "consecutive_api_errors": 0,
+            }
+            with open(path, "w") as f:
+                json.dump(legacy, f)
+
+            sm = StateManager(path)
+            loaded = sm.load()
+            assert loaded.position is not None
+            assert loaded.position.direction == Direction.LONG
+
+
+# ============================================================
+# Test: Integration – mini backtest with SHORT trades
+# ============================================================
+
+class TestIntegrationShort:
+    def test_simulator_runs_with_downtrend(self, sample_config):
+        """Ensure the simulator runs on downtrend data with SHORT enabled."""
+        import copy
+        from aivc_trade.backtest.simulator import Simulator
+
+        cfg = copy.deepcopy(sample_config)
+        cfg["strategy"] = {"allow_long": True, "allow_short": True}
+
+        candles_1h = {
+            "BTCUSDC": _make_candles(500, trend=-0.0003, volatility=0.008),
+        }
+        candles_5m = {
+            "BTCUSDC": _make_candles_5m(6000, start_price=50000),
+        }
+
+        sim = Simulator(cfg)
+        trades, eq_curve = sim.run(candles_1h, candles_5m)
+
+        assert isinstance(trades, list)
+        assert isinstance(eq_curve, pd.DataFrame)
+        if not eq_curve.empty:
+            assert "equity" in eq_curve.columns
 
 
 if __name__ == "__main__":

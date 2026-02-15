@@ -14,9 +14,16 @@ from typing import Optional
 
 class Regime(enum.Enum):
     TREND_UP = "TREND_UP"
+    TREND_DOWN = "TREND_DOWN"
+    DOWN_TREND_STRICT = "DOWN_TREND_STRICT"
     RANGE = "RANGE"
     CHAOS = "CHAOS"
     OFF = "OFF"
+
+
+class Direction(str, enum.Enum):
+    LONG = "LONG"
+    SHORT = "SHORT"
 
 
 class Side(enum.Enum):
@@ -40,6 +47,7 @@ class ExitReason(enum.Enum):
     REGIME_EXIT_RANGE_RUNNER = "REGIME_EXIT_RANGE_RUNNER"
     REGIME_EXIT_RANGE_RUNNER_TIMEOUT = "REGIME_EXIT_RANGE_RUNNER_TIMEOUT"
     REGIME_EXIT_TIMEOUT = "REGIME_EXIT_TIMEOUT"
+    TIMEOUT_SHORT = "TIMEOUT_SHORT"
     PARTIAL_TP = "PARTIAL_TP"
     MANUAL = "MANUAL"
     CIRCUIT_BREAKER = "CIRCUIT_BREAKER"
@@ -82,6 +90,8 @@ class FeatureRow:
     volume_sma: float = 0.0
     # Structure
     recent_swing_low: float = 0.0
+    recent_swing_high: float = 0.0
+    donchian_low_prev: float = 0.0
     # Regime
     regime: Regime = Regime.RANGE
     # 6h max drop
@@ -105,11 +115,14 @@ class Signal:
     ts: datetime
     symbol: str
     side: Side = Side.BUY
+    direction: Direction = Direction.LONG
     entry_type: str = "PULLBACK_BREAKOUT"
     score: float = 0.0
     stop_price: float = 0.0
     entry_price: float = 0.0
     ml_score: float = 0.0  # PhaseB: LightGBM entry probability
+    regime_at_entry: str = ""
+    entry_filters_passed: bool = True
 
 
 @dataclass
@@ -118,6 +131,7 @@ class Position:
     qty: float
     entry_price: float
     stop_price: float
+    direction: Direction = Direction.LONG
     initial_stop_price: float = 0.0
     trail_price: float = 0.0
     entry_ts: Optional[datetime] = None
@@ -140,9 +154,17 @@ class Position:
     trail_activated: bool = False
     breakeven_done: bool = False
     regime_at_entry: str = ""
+    entry_type: str = ""
+    entry_filters_passed: bool = True
     mfe_pct: float = 0.0
     mae_pct: float = 0.0
+    mfe_abs: float = 0.0
+    mae_abs: float = 0.0
     bars_since_entry: int = 0
+    derisk_done: bool = False
+    timeout_extended: bool = False
+    max_hold_hours: float = 0.0
+    runner_trail_atr_k: float = 0.0
 
 
 @dataclass
@@ -163,12 +185,13 @@ class TradeRecord:
     """Closed-trade record for metrics."""
     symbol: str
     side: Side
-    entry_price: float
-    exit_price: float
     qty: float
     entry_ts: datetime
     exit_ts: datetime
     exit_reason: ExitReason
+    direction: Direction = Direction.LONG
+    entry_price: float = 0.0
+    exit_price: float = 0.0
     pnl: float = 0.0
     pnl_pct: float = 0.0
     cost: float = 0.0
@@ -190,6 +213,8 @@ class TradeRecord:
     regime_at_entry: str = ""
     unrealized_pct_at_event: float = 0.0
     bars_held: int = 0
+    entry_type: str = ""
+    entry_filters_passed: bool = True
 
 
 @dataclass

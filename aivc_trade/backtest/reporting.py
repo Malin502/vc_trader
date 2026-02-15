@@ -22,6 +22,7 @@ def trades_to_dataframe(trades: List[TradeRecord]) -> pd.DataFrame:
         [
             {
                 "symbol": t.symbol,
+                "side": t.side.value if hasattr(t.side, "value") else str(t.side),
                 "entry_price": t.entry_price,
                 "exit_price": t.exit_price,
                 "qty": t.qty,
@@ -33,6 +34,7 @@ def trades_to_dataframe(trades: List[TradeRecord]) -> pd.DataFrame:
                 "gross_pnl": t.gross_pnl,
                 "pnl_pct": t.pnl_pct,
                 "holding_hours": t.holding_hours,
+                "hold_hours": t.holding_hours,
                 "entry_cost": t.entry_cost,
                 "exit_cost": t.exit_cost,
                 "total_cost": t.total_cost if t.total_cost != 0 else t.cost,
@@ -44,6 +46,9 @@ def trades_to_dataframe(trades: List[TradeRecord]) -> pd.DataFrame:
                 "event_type": t.event_type,
                 "runner_mode": t.runner_mode,
                 "regime_at_exit": t.regime_at_exit,
+                "regime_at_entry": t.regime_at_entry,
+                "entry_type": t.entry_type,
+                "entry_filters_passed": t.entry_filters_passed,
                 "unrealized_pct_at_event": t.unrealized_pct_at_event,
             }
             for t in trades
@@ -183,28 +188,81 @@ def _plot_1h_trade_charts(
             entry_idx = np.clip(entry_idx, 0, len(df) - 1)
             exit_idx = np.clip(exit_idx, 0, len(df) - 1)
 
-            ax.scatter(
-                entry_idx,
-                sym_trades["entry_price"],
-                marker="^",
-                s=55,
-                color="#1565c0",
-                edgecolors="white",
-                linewidths=0.6,
-                label="IN",
-                zorder=4,
-            )
-            ax.scatter(
-                exit_idx,
-                sym_trades["exit_price"],
-                marker="v",
-                s=55,
-                color="#ef6c00",
-                edgecolors="white",
-                linewidths=0.6,
-                label="OUT",
-                zorder=4,
-            )
+            side_series = sym_trades.get("side", pd.Series(index=sym_trades.index, dtype=str)).astype(str).str.upper()
+            long_mask = side_series == "BUY"
+            short_mask = side_series == "SELL"
+            unknown_mask = ~(long_mask | short_mask)
+
+            if long_mask.any():
+                ax.scatter(
+                    entry_idx[long_mask.to_numpy()],
+                    sym_trades.loc[long_mask, "entry_price"],
+                    marker="^",
+                    s=60,
+                    color="#1565c0",
+                    edgecolors="white",
+                    linewidths=0.6,
+                    label="LONG IN",
+                    zorder=4,
+                )
+                ax.scatter(
+                    exit_idx[long_mask.to_numpy()],
+                    sym_trades.loc[long_mask, "exit_price"],
+                    marker="v",
+                    s=60,
+                    color="#42a5f5",
+                    edgecolors="white",
+                    linewidths=0.6,
+                    label="LONG OUT",
+                    zorder=4,
+                )
+
+            if short_mask.any():
+                ax.scatter(
+                    entry_idx[short_mask.to_numpy()],
+                    sym_trades.loc[short_mask, "entry_price"],
+                    marker="v",
+                    s=60,
+                    color="#8e24aa",
+                    edgecolors="white",
+                    linewidths=0.6,
+                    label="SHORT IN",
+                    zorder=4,
+                )
+                ax.scatter(
+                    exit_idx[short_mask.to_numpy()],
+                    sym_trades.loc[short_mask, "exit_price"],
+                    marker="^",
+                    s=60,
+                    color="#ef5350",
+                    edgecolors="white",
+                    linewidths=0.6,
+                    label="SHORT OUT",
+                    zorder=4,
+                )
+
+            if unknown_mask.any():
+                ax.scatter(
+                    entry_idx[unknown_mask.to_numpy()],
+                    sym_trades.loc[unknown_mask, "entry_price"],
+                    marker="o",
+                    s=50,
+                    color="#546e7a",
+                    edgecolors="white",
+                    linewidths=0.6,
+                    label="IN (UNKNOWN)",
+                    zorder=4,
+                )
+                ax.scatter(
+                    exit_idx[unknown_mask.to_numpy()],
+                    sym_trades.loc[unknown_mask, "exit_price"],
+                    marker="x",
+                    s=55,
+                    color="#ef6c00",
+                    linewidths=1.0,
+                    label="OUT (UNKNOWN)",
+                    zorder=4,
+                )
 
             for row_id, trade in sym_trades.iterrows():
                 color = "#2e7d32" if float(trade.get("net_pnl", 0.0)) >= 0 else "#c62828"

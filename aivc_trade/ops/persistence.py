@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from aivc_trade.core.types import Position, SystemState
+from aivc_trade.core.types import Direction, Position, SystemState
 from aivc_trade.core.logger import get_logger
 
 log = get_logger("persistence")
@@ -53,6 +53,7 @@ class StateManager:
                 "qty": p.qty,
                 "entry_price": p.entry_price,
                 "stop_price": p.stop_price,
+                "direction": p.direction.value,
                 "initial_stop_price": p.initial_stop_price,
                 "trail_price": p.trail_price,
                 "entry_ts": p.entry_ts.isoformat() if p.entry_ts else None,
@@ -69,6 +70,11 @@ class StateManager:
                 "runner_trail_price": p.runner_trail_price,
                 "breakeven_done": p.breakeven_done,
                 "bars_since_entry": p.bars_since_entry,
+                "regime_at_entry": p.regime_at_entry,
+                "entry_type": p.entry_type,
+                "entry_filters_passed": p.entry_filters_passed,
+                "mfe_abs": p.mfe_abs,
+                "mae_abs": p.mae_abs,
             }
         else:
             d["position"] = None
@@ -91,6 +97,7 @@ class StateManager:
                 qty=pos_data["qty"],
                 entry_price=pos_data["entry_price"],
                 stop_price=pos_data["stop_price"],
+                direction=Direction(pos_data.get("direction", "LONG")),
                 initial_stop_price=pos_data.get("initial_stop_price", 0.0),
                 trail_price=pos_data.get("trail_price", 0.0),
                 entry_ts=_parse_dt(pos_data.get("entry_ts")),
@@ -107,6 +114,11 @@ class StateManager:
                 runner_trail_price=pos_data.get("runner_trail_price", 0.0),
                 breakeven_done=pos_data.get("breakeven_done", False),
                 bars_since_entry=int(pos_data.get("bars_since_entry", 0)),
+                regime_at_entry=pos_data.get("regime_at_entry", ""),
+                entry_type=pos_data.get("entry_type", ""),
+                entry_filters_passed=bool(pos_data.get("entry_filters_passed", True)),
+                mfe_abs=float(pos_data.get("mfe_abs", 0.0)),
+                mae_abs=float(pos_data.get("mae_abs", 0.0)),
             )
 
         state.last_signal_ts = _parse_dt(d.get("last_signal_ts"))
