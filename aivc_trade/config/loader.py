@@ -259,6 +259,15 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
             if float(short_trail.get("atr_k", 0.0)) <= 0:
                 raise ValueError("Invalid config: short.trail.atr_k must be > 0")
 
+    phaseb_cfg = cfg.get("phaseb", cfg.get("phase_b", {}))
+    if phaseb_cfg:
+        tbk = phaseb_cfg.get("top_bottom_k", {})
+        if tbk:
+            if int(tbk.get("k_long", 0)) < 0:
+                raise ValueError("Invalid config: phaseb.top_bottom_k.k_long must be >= 0")
+            if int(tbk.get("k_short", 0)) < 0:
+                raise ValueError("Invalid config: phaseb.top_bottom_k.k_short must be >= 0")
+
     phase_b_cfg = cfg.get("phaseb", cfg.get("phase_b", {}))
     if phase_b_cfg:
         mode = str(phase_b_cfg.get("mode", "directional")).lower()
@@ -280,15 +289,17 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
                     raise ValueError(f"Invalid config: phaseb.{side_key}.alpha must satisfy 0 < x < 1")
                 thr_cfg = model_cfg.get("threshold", {})
                 thr_mode = str(thr_cfg.get("mode", "top_pct")).lower()
-                if thr_mode not in {"top_pct", "fixed"}:
-                    raise ValueError(f"Invalid config: phaseb.{side_key}.threshold.mode must be top_pct or fixed")
+                if thr_mode not in {"top_pct", "fixed", "rank_only"}:
+                    raise ValueError(
+                        f"Invalid config: phaseb.{side_key}.threshold.mode must be top_pct, fixed, or rank_only"
+                    )
                 if thr_mode == "top_pct":
                     top_pct = float(thr_cfg.get("top_pct", 0.15))
                     if not (0.0 <= top_pct <= 1.0):
                         raise ValueError(
                             f"Invalid config: phaseb.{side_key}.threshold.top_pct must satisfy 0 <= x <= 1"
                         )
-                else:
+                elif thr_mode == "fixed":
                     val = float(thr_cfg.get("value", 0.0))
                     if not (-100.0 <= val <= 100.0):
                         raise ValueError(

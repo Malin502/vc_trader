@@ -132,6 +132,14 @@ class Position:
     entry_price: float
     stop_price: float
     direction: Direction = Direction.LONG
+    base_qty: float = 0.0
+    final_qty: float = 0.0
+    size_mult: float = 1.0
+    phaseb_score: float = 0.0
+    phaseb_z_score: float = 0.0
+    phaseb_raw_signal: float = 0.0
+    phaseb_clipped_low: bool = False
+    phaseb_clipped_high: bool = False
     initial_stop_price: float = 0.0
     trail_price: float = 0.0
     entry_ts: Optional[datetime] = None
@@ -215,6 +223,12 @@ class TradeRecord:
     bars_held: int = 0
     entry_type: str = ""
     entry_filters_passed: bool = True
+    phaseb_score_at_entry: float = 0.0
+    size_mult_at_entry: float = 1.0
+    qty_base: float = 0.0
+    qty_final: float = 0.0
+    phaseb_clipped_low: bool = False
+    phaseb_clipped_high: bool = False
 
 
 @dataclass

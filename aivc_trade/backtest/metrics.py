@@ -35,6 +35,17 @@ def _compute_sharpe_from_curve(equity_curve: pd.DataFrame) -> float:
     return float((daily_ret.mean() / daily_ret.std()) * np.sqrt(365))
 
 
+def _spearman_corr(x: pd.Series, y: pd.Series) -> float:
+    if len(x) < 2 or len(y) < 2:
+        return 0.0
+    xr = x.rank(method="average")
+    yr = y.rank(method="average")
+    corr = xr.corr(yr, method="pearson")
+    if pd.isna(corr):
+        return 0.0
+    return float(corr)
+
+
 def _losing_streaks(pnls: List[float]) -> List[int]:
     streaks: List[int] = []
     run = 0
@@ -97,6 +108,14 @@ def compute_metrics(
             "largest_single_loss": 0.0,
             "worst_losing_cluster": 0.0,
             "dominant_driver": "n/a",
+        }
+        result["phaseb_sizing"] = {
+            "mean_size_mult": 0.0,
+            "var_size_mult": 0.0,
+            "clip_rate_low": 0.0,
+            "clip_rate_high": 0.0,
+            "clip_rate_total": 0.0,
+            "score_pnl_spearman": 0.0,
         }
         result["passed"] = False
         return result
@@ -161,6 +180,10 @@ def compute_metrics(
                 "holding_hours": t.holding_hours,
                 "mae": t.mae,
                 "mfe": t.mfe,
+                "phaseb_score_at_entry": float(t.phaseb_score_at_entry),
+                "size_mult_at_entry": float(t.size_mult_at_entry),
+                "phaseb_clipped_low": bool(t.phaseb_clipped_low),
+                "phaseb_clipped_high": bool(t.phaseb_clipped_high),
             }
             for t in trades
         ]
@@ -269,6 +292,22 @@ def compute_metrics(
             if abs(largest_single_loss) > abs(worst_streak_pnl)
             else "losing_cluster"
         ),
+    }
+
+    # --- PhaseB sizing diagnostics ---
+    size_mult = df_tr["size_mult_at_entry"].astype(float) if "size_mult_at_entry" in df_tr.columns else pd.Series(dtype=float)
+    clip_low = df_tr["phaseb_clipped_low"].astype(bool) if "phaseb_clipped_low" in df_tr.columns else pd.Series(dtype=bool)
+    clip_high = df_tr["phaseb_clipped_high"].astype(bool) if "phaseb_clipped_high" in df_tr.columns else pd.Series(dtype=bool)
+    score = df_tr["phaseb_score_at_entry"].astype(float) if "phaseb_score_at_entry" in df_tr.columns else pd.Series(dtype=float)
+    result["phaseb_sizing"] = {
+        "mean_size_mult": float(size_mult.mean()) if not size_mult.empty else 0.0,
+        "var_size_mult": float(size_mult.var(ddof=0)) if not size_mult.empty else 0.0,
+        "clip_rate_low": float(clip_low.mean()) if not clip_low.empty else 0.0,
+        "clip_rate_high": float(clip_high.mean()) if not clip_high.empty else 0.0,
+        "clip_rate_total": float((clip_low | clip_high).mean()) if not clip_low.empty and not clip_high.empty else 0.0,
+        "score_pnl_spearman": _spearman_corr(score, df_tr["net_pnl"].astype(float))
+        if (not score.empty and "net_pnl" in df_tr.columns)
+        else 0.0,
     }
 
     # --- Phase A pass criteria ---

@@ -246,6 +246,20 @@ def train_directional_models(
             "test_long_top_rate": float((test_long_score >= thr_long).mean()) if len(test_long_score) else 0.0,
             "test_short_top_rate": float((test_short_score >= thr_short).mean()) if len(test_short_score) else 0.0,
         },
+        "score_stats": {
+            "long": {
+                "mu": float(np.mean(val_long_score)) if len(val_long_score) else 0.0,
+                "sigma": float(np.std(val_long_score)) if len(val_long_score) else 1.0,
+                "median": float(np.median(val_long_score)) if len(val_long_score) else 0.0,
+                "mad": float(np.median(np.abs(val_long_score - np.median(val_long_score)))) if len(val_long_score) else 1.0,
+            },
+            "short": {
+                "mu": float(np.mean(val_short_score)) if len(val_short_score) else 0.0,
+                "sigma": float(np.std(val_short_score)) if len(val_short_score) else 1.0,
+                "median": float(np.median(val_short_score)) if len(val_short_score) else 0.0,
+                "mad": float(np.median(np.abs(val_short_score - np.median(val_short_score)))) if len(val_short_score) else 1.0,
+            },
+        },
     }
 
     meta_path.parent.mkdir(parents=True, exist_ok=True)

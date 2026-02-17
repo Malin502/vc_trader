@@ -1,0 +1,84 @@
+{
+  "mode": "directional",
+  "feature_cols": [
+    "ret_1h",
+    "ret_4h",
+    "ret_24h",
+    "atr",
+    "atr_pct",
+    "adx",
+    "vol_rolling_std",
+    "ema_fast",
+    "ema_slow",
+    "ema_slope",
+    "ma_gap",
+    "trend_strength",
+    "vol_z",
+    "vol_spike",
+    "vol_change",
+    "range_pos",
+    "drawdown_from_recent_high",
+    "gap_like",
+    "wick_up_ratio",
+    "wick_down_ratio",
+    "regime_id",
+    "regime_strength",
+    "upper_wick_ratio",
+    "lower_wick_ratio",
+    "downside_vol",
+    "bear_pressure",
+    "pump_24h_flag",
+    "rsi_14",
+    "rsi_overbought_flag",
+    "atr_change"
+  ],
+  "horizon_bars": 24,
+  "w_mae": 1.0,
+  "cost_bps_roundtrip": 20.0,
+  "model_long": {
+    "model_path": "models/phaseb_long_lgbm.pkl",
+    "objective": "quantile",
+    "alpha": 0.8,
+    "threshold": 0.0
+  },
+  "model_short": {
+    "model_path": "models/phaseb_short_lgbm.pkl",
+    "objective": "quantile",
+    "alpha": 0.8,
+    "threshold": 0.0
+  },
+  "period": {
+    "train_start": "2021-01-01 00:00:00+00:00",
+    "train_end": "2023-10-20 15:00:00+00:00",
+    "val_start": "2023-10-20 15:00:00+00:00",
+    "val_end": "2024-09-25 07:00:00+00:00",
+    "test_start": "2024-09-25 07:00:00+00:00",
+    "test_end": "2025-08-31 23:00:00+00:00"
+  },
+  "stats": {
+    "n_total": 367938,
+    "n_train": 220762,
+    "n_val": 73587,
+    "n_test": 73589,
+    "n_train_long": 220762,
+    "n_train_short": 220762,
+    "val_long_top_rate": 1.0,
+    "val_short_top_rate": 1.0,
+    "test_long_top_rate": 1.0,
+    "test_short_top_rate": 1.0
+  },
+  "score_stats": {
+    "long": {
+      "mu": 0.03398575361746701,
+      "sigma": 0.014037994839133589,
+      "median": 0.030539789082848958,
+      "mad": 0.007186821234598014
+    },
+    "short": {
+      "mu": 0.03747526576506264,
+      "sigma": 0.01210264238188251,
+      "median": 0.0360823472052658,
+      "mad": 0.006035904102230951
+    }
+  }
+}

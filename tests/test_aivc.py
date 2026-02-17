@@ -1402,6 +1402,68 @@ class TestSignalMLScore:
 
 
 # ============================================================
+# Test: PhaseB Sizing
+# ============================================================
+
+class TestPhaseBSizing:
+    def test_size_mult_is_clipped(self, sample_config):
+        import copy
+        from aivc_trade.core.types import Direction
+        from aivc_trade.ml.gate import create_phase_b_sizer
+
+        cfg = copy.deepcopy(sample_config)
+        cfg["phaseb"]["enabled"] = True
+        cfg["phaseb"]["sizing"]["enabled"] = True
+        cfg["phaseb"]["sizing"]["method"] = "linear_z"
+        cfg["phaseb"]["sizing"]["k"] = 10.0
+        cfg["phaseb"]["sizing"]["min_mult"] = 0.7
+        cfg["phaseb"]["sizing"]["max_mult"] = 1.3
+        cfg["phaseb"]["sizing"]["stats_source"] = "fixed"
+        cfg["phaseb"]["sizing"]["fixed_stats"]["long"]["mu"] = 0.0
+        cfg["phaseb"]["sizing"]["fixed_stats"]["long"]["sigma"] = 1.0
+
+        sizer = create_phase_b_sizer(cfg)
+        low = sizer.size_from_score(-100.0, Direction.LONG)
+        high = sizer.size_from_score(100.0, Direction.LONG)
+
+        assert 0.7 <= low.size_mult <= 1.3
+        assert 0.7 <= high.size_mult <= 1.3
+        assert low.size_mult == pytest.approx(0.7)
+        assert high.size_mult == pytest.approx(1.3)
+
+    def test_size_mult_monotonic_in_score(self, sample_config):
+        import copy
+        from aivc_trade.core.types import Direction
+        from aivc_trade.ml.gate import create_phase_b_sizer
+
+        cfg = copy.deepcopy(sample_config)
+        cfg["phaseb"]["enabled"] = True
+        cfg["phaseb"]["sizing"]["enabled"] = True
+        cfg["phaseb"]["sizing"]["method"] = "sigmoid_z"
+        cfg["phaseb"]["sizing"]["stats_source"] = "fixed"
+        cfg["phaseb"]["sizing"]["fixed_stats"]["long"]["mu"] = 0.0
+        cfg["phaseb"]["sizing"]["fixed_stats"]["long"]["sigma"] = 1.0
+
+        sizer = create_phase_b_sizer(cfg)
+        scores = [-2.0, -1.0, 0.0, 1.0, 2.0]
+        mults = [sizer.size_from_score(sc, Direction.LONG).size_mult for sc in scores]
+        assert all(mults[i] <= mults[i + 1] for i in range(len(mults) - 1))
+
+    def test_sizing_disabled_returns_one(self, sample_config):
+        import copy
+        from aivc_trade.core.types import Direction
+        from aivc_trade.ml.gate import create_phase_b_sizer
+
+        cfg = copy.deepcopy(sample_config)
+        cfg["phaseb"]["enabled"] = True
+        cfg["phaseb"]["sizing"]["enabled"] = False
+
+        sizer = create_phase_b_sizer(cfg)
+        res = sizer.size_from_score(5.0, Direction.SHORT)
+        assert res.size_mult == pytest.approx(1.0)
+
+
+# ============================================================
 # Test: PhaseB timezone alignment (Issue A)
 # ============================================================
 

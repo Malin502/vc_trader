@@ -50,6 +50,12 @@ def trades_to_dataframe(trades: List[TradeRecord]) -> pd.DataFrame:
                 "entry_type": t.entry_type,
                 "entry_filters_passed": t.entry_filters_passed,
                 "unrealized_pct_at_event": t.unrealized_pct_at_event,
+                "phaseb_score_at_entry": t.phaseb_score_at_entry,
+                "size_mult_at_entry": t.size_mult_at_entry,
+                "qty_base": t.qty_base,
+                "qty_final": t.qty_final,
+                "phaseb_clipped_low": t.phaseb_clipped_low,
+                "phaseb_clipped_high": t.phaseb_clipped_high,
             }
             for t in trades
         ]

@@ -39,6 +39,8 @@ class PhaseBGate:
         self.feature_cols: list[str] = []
         self.threshold_long = 0.0
         self.threshold_short = 0.0
+        self.threshold_mode_long = "top_pct"
+        self.threshold_mode_short = "top_pct"
         self.scorer: Optional[PhaseBScorer] = None
 
         self.model_long_cfg = pb_cfg.get("model_long", {})
@@ -64,11 +66,16 @@ class PhaseBGate:
             self.threshold_long = float(meta.get("model_long", {}).get("threshold", 0.0))
             self.threshold_short = float(meta.get("model_short", {}).get("threshold", 0.0))
 
-        # config override has priority.
-        if self.model_long_cfg.get("threshold", {}).get("mode", "top_pct") != "top_pct":
-            self.threshold_long = float(self.model_long_cfg.get("threshold", {}).get("value", self.threshold_long))
-        if self.model_short_cfg.get("threshold", {}).get("mode", "top_pct") != "top_pct":
-            self.threshold_short = float(self.model_short_cfg.get("threshold", {}).get("value", self.threshold_short))
+        long_thr_cfg = self.model_long_cfg.get("threshold", {})
+        short_thr_cfg = self.model_short_cfg.get("threshold", {})
+        self.threshold_mode_long = str(long_thr_cfg.get("mode", "top_pct")).lower()
+        self.threshold_mode_short = str(short_thr_cfg.get("mode", "top_pct")).lower()
+
+        # config override has priority for non-percentile modes.
+        if self.threshold_mode_long not in {"top_pct", "quantile"}:
+            self.threshold_long = float(long_thr_cfg.get("value", self.threshold_long))
+        if self.threshold_mode_short not in {"top_pct", "quantile"}:
+            self.threshold_short = float(short_thr_cfg.get("value", self.threshold_short))
 
         if not self.feature_cols:
             _, cols = build_features(pd.DataFrame([{"open": 0, "high": 0, "low": 0, "close": 0, "volume": 0}]))
@@ -122,15 +129,20 @@ class PhaseBGate:
         if phaseA_signal == Direction.LONG:
             score = self.scorer.score_long(x_row)
             thr = float(self.threshold_long)
+            mode = self.threshold_mode_long
         elif phaseA_signal == Direction.SHORT:
             score = self.scorer.score_short(x_row)
             thr = float(self.threshold_short)
+            mode = self.threshold_mode_short
         else:
             return GateResult(False, 0.0, 0.0, "invalid_signal")
 
         ok_extra, extra_reason = self._extra_filters_ok(feature_row, phaseA_signal)
         if not ok_extra:
             return GateResult(False, float(score), float(thr), extra_reason)
+
+        if mode in {"rank_only", "none", "off"}:
+            return GateResult(True, float(score), float(thr), "rank_only")
 
         if score >= thr:
             return GateResult(True, float(score), float(thr), "pass")

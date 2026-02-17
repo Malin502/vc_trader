@@ -96,6 +96,22 @@ class Simulator:
         self.last_run_stats: Dict[str, Any] = {}
         # PhaseB gate model (binary allow/skip)
         self.phase_b_gate = create_phase_b_gate(cfg)
+        pb_cfg = cfg.get("phaseb", cfg.get("phase_b", {}))
+        self.phaseb_top_bottom_cfg = pb_cfg.get("top_bottom_k", {})
+        self.phaseb_top_bottom_enabled = bool(self.phaseb_top_bottom_cfg.get("enabled", False))
+        self.phaseb_top_k_long = int(self.phaseb_top_bottom_cfg.get("k_long", 0))
+        self.phaseb_bottom_k_short = int(self.phaseb_top_bottom_cfg.get("k_short", 0))
+        self.phaseb_long_score_min = float(self.phaseb_top_bottom_cfg.get("long_score_min", 0.0))
+        self.phaseb_short_score_max = float(self.phaseb_top_bottom_cfg.get("short_score_max", 0.0))
+
+        # PhaseB rolling-z position sizing
+        pb_sizing_cfg = pb_cfg.get("sizing", {})
+        self.phaseb_sizing_enabled = bool(pb_sizing_cfg.get("enabled", False))
+        self.phaseb_sizing_k = float(pb_sizing_cfg.get("k", 0.3))
+        self.phaseb_sizing_min_mult = float(pb_sizing_cfg.get("min_mult", 0.7))
+        self.phaseb_sizing_max_mult = float(pb_sizing_cfg.get("max_mult", 1.3))
+        self.phaseb_sizing_rolling_window = int(pb_sizing_cfg.get("rolling_window", 20))
+        self.phaseb_sizing_warmup_n = int(pb_sizing_cfg.get("warmup_n", 5))
 
     def run(
         self,
@@ -166,6 +182,8 @@ class Simulator:
         trades: List[TradeRecord] = []
         equity_records: List[Dict[str, Any]] = []
         phase_b_skips: List[Dict[str, Any]] = []
+        phase_b_sizing_logs: List[Dict[str, Any]] = []
+        phaseb_score_history: Dict[str, List[float]] = {}
         entry_bar_idx: int = 0  # bar index when position was entered
 
         # Pre-index 5m data for quick lookup
@@ -405,6 +423,7 @@ class Simulator:
 
                 if signals and self.phase_b_gate.enabled:
                     filtered_signals = []
+                    phaseb_scores: Dict[Tuple[str, Direction], float] = {}
                     for sig in signals:
                         feat_df = feat_at.get(sig.symbol)
                         if feat_df is None or feat_df.empty:
@@ -416,6 +435,8 @@ class Simulator:
                             feature_row=row,
                         )
                         if gate_result.allow_entry:
+                            sig.ml_score = float(gate_result.phaseb_score)
+                            phaseb_scores[(sig.symbol, sig.direction)] = float(gate_result.phaseb_score)
                             filtered_signals.append(sig)
                         else:
                             phase_b_skips.append(
@@ -430,6 +451,13 @@ class Simulator:
                                 }
                             )
                     signals = filtered_signals
+                    if signals and self.phaseb_top_bottom_enabled:
+                        signals = self._apply_phaseb_top_bottom_k(
+                            ts=ts,
+                            signals=signals,
+                            phaseb_scores=phaseb_scores,
+                            phase_b_skips=phase_b_skips,
+                        )
 
                 if signals:
                     best = signals[0]
@@ -461,11 +489,22 @@ class Simulator:
                         best.stop_price = directional_initial_stop(best.direction, entry_price, 5.0)
 
                     risk_multiplier = self._resolve_position_scale(global_loss_streak)
+
+                    # PhaseB rolling-z position sizing
+                    phaseb_score_val = float(best.ml_score)
+                    size_mult, pb_z, pb_raw, pb_clip_lo, pb_clip_hi, sizing_reason = (
+                        self._compute_phaseb_size_mult(
+                            phaseb_score_val, best.direction, phaseb_score_history
+                        )
+                    )
+                    # Update history AFTER computing this trade's sizing (no lookahead)
+                    phaseb_score_history.setdefault(best.direction.value, []).append(phaseb_score_val)
+
                     qty = compute_qty(
                         best, equity, self.cfg,
                         lot_step=0.00001 if "BTC" in best.symbol else 0.0001,
                         min_qty=0.00001 if "BTC" in best.symbol else 0.0001,
-                        risk_multiplier=risk_multiplier,
+                        risk_multiplier=risk_multiplier * size_mult,
                     )
                     if qty > 0:
                         atr_at_entry = 0.0
@@ -490,6 +529,13 @@ class Simulator:
                             entry_price=entry_price,
                             stop_price=best.stop_price,
                             direction=best.direction,
+                            base_qty=qty / size_mult if size_mult > 0 else qty,
+                            final_qty=qty,
+                            size_mult=size_mult,
+                            phaseb_z_score=pb_z,
+                            phaseb_raw_signal=pb_raw,
+                            phaseb_clipped_low=pb_clip_lo,
+                            phaseb_clipped_high=pb_clip_hi,
                             initial_stop_price=0.0,
                             entry_ts=ts,
                             highest_price=entry_price,
@@ -501,6 +547,7 @@ class Simulator:
                             regime_at_entry=regime_at_entry_str,
                             entry_type=best.entry_type,
                             entry_filters_passed=best.entry_filters_passed,
+                            phaseb_score=best.ml_score,
                             mode="CORE",
                             bars_since_entry=0,
                             max_hold_hours=float(
@@ -509,6 +556,20 @@ class Simulator:
                             if best.direction == Direction.SHORT
                             else 0.0,
                         )
+                        if self.phaseb_sizing_enabled:
+                            phase_b_sizing_logs.append({
+                                "time": ts,
+                                "symbol": best.symbol,
+                                "side": best.direction.value,
+                                "phaseA_score": float(best.score),
+                                "phaseB_score": phaseb_score_val,
+                                "size_mult": size_mult,
+                                "z_score": pb_z,
+                                "raw_signal": pb_raw,
+                                "clipped_low": pb_clip_lo,
+                                "clipped_high": pb_clip_hi,
+                                "reason": sizing_reason,
+                            })
                         # Recompute and enforce ATR-based initial stop from actual entry price.
                         swing_low = None
                         swing_high = None
@@ -567,6 +628,7 @@ class Simulator:
             "regime_halts": int(regime_halts),
             "strategy_halt_until": strategy_halt_until,
             "phase_b_skips": phase_b_skips,
+            "phase_b_sizing": phase_b_sizing_logs,
             "last_entry_time_global": last_entry_time_global,
             "last_entry_time_by_symbol": last_entry_time_by_symbol,
             "last_entry_score_by_symbol": last_entry_score_by_symbol,
@@ -576,6 +638,74 @@ class Simulator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _apply_phaseb_top_bottom_k(
+        self,
+        ts: datetime,
+        signals: List[Any],
+        phaseb_scores: Dict[Tuple[str, Direction], float],
+        phase_b_skips: List[Dict[str, Any]],
+    ) -> List[Any]:
+        long_pass = []
+        short_pass = []
+        for sig in signals:
+            score = phaseb_scores.get((sig.symbol, sig.direction), float(sig.ml_score))
+            sig.ml_score = float(score)
+            if sig.direction == Direction.LONG:
+                if score >= self.phaseb_long_score_min:
+                    long_pass.append(sig)
+                else:
+                    phase_b_skips.append(
+                        {
+                            "time": ts,
+                            "symbol": sig.symbol,
+                            "side": sig.direction.value,
+                            "phaseA_score": float(sig.score),
+                            "phaseB_score": float(score),
+                            "threshold": float(self.phaseb_long_score_min),
+                            "reason": "topk_long_below_min",
+                        }
+                    )
+            elif sig.direction == Direction.SHORT:
+                if score <= self.phaseb_short_score_max:
+                    short_pass.append(sig)
+                else:
+                    phase_b_skips.append(
+                        {
+                            "time": ts,
+                            "symbol": sig.symbol,
+                            "side": sig.direction.value,
+                            "phaseA_score": float(sig.score),
+                            "phaseB_score": float(score),
+                            "threshold": float(self.phaseb_short_score_max),
+                            "reason": "bottomk_short_above_max",
+                        }
+                    )
+
+        k_long = max(self.phaseb_top_k_long, 0)
+        k_short = max(self.phaseb_bottom_k_short, 0)
+        if k_long > 0:
+            long_pass.sort(key=lambda s: float(s.ml_score), reverse=True)
+            long_pass = long_pass[:k_long]
+        else:
+            long_pass = []
+        if k_short > 0:
+            short_pass.sort(key=lambda s: float(s.ml_score))
+            short_pass = short_pass[:k_short]
+        else:
+            short_pass = []
+
+        selected = long_pass + short_pass
+        if not selected:
+            return []
+
+        def _conviction(sig: Any) -> float:
+            if sig.direction == Direction.LONG:
+                return float(sig.ml_score) - self.phaseb_long_score_min
+            return self.phaseb_short_score_max - float(sig.ml_score)
+
+        selected.sort(key=_conviction, reverse=True)
+        return selected
+
     def _apply_partial_fill(
         self,
         pos: Position,
@@ -957,6 +1087,43 @@ class Simulator:
             return self.regime_exit_cooldown_hours
         return int(self.cfg["position"]["cooldown_hours"])
 
+    def _compute_phaseb_size_mult(
+        self,
+        score: float,
+        direction: Direction,
+        score_history: Dict[str, List[float]],
+    ) -> tuple[float, float, float, bool, bool, str]:
+        """PhaseB スコアからローリング z-score で size_mult を計算する。
+
+        Returns
+        -------
+        (size_mult, z_score, raw_signal, clipped_low, clipped_high, reason)
+        """
+        if not self.phaseb_sizing_enabled or score <= 0.0:
+            return 1.0, 0.0, 0.0, False, False, "sizing_disabled"
+
+        key = direction.value
+        history = score_history.get(key, [])
+
+        if len(history) < self.phaseb_sizing_warmup_n:
+            return 1.0, 0.0, 0.0, False, False, "warmup"
+
+        window = history[-self.phaseb_sizing_rolling_window:]
+        n = len(window)
+        mu = sum(window) / n
+        variance = sum((x - mu) ** 2 for x in window) / n
+        sigma = variance ** 0.5
+
+        if sigma <= 0.0:
+            return 1.0, 0.0, 0.0, False, False, "sigma_zero"
+
+        z = (score - mu) / sigma
+        raw_signal = 1.0 + self.phaseb_sizing_k * z
+        clipped_low = raw_signal < self.phaseb_sizing_min_mult
+        clipped_high = raw_signal > self.phaseb_sizing_max_mult
+        size_mult = max(self.phaseb_sizing_min_mult, min(self.phaseb_sizing_max_mult, raw_signal))
+        return size_mult, z, raw_signal, clipped_low, clipped_high, "ok"
+
     def _get_next_bar_open(
         self, df: Optional[pd.DataFrame], current_ts: datetime
     ) -> Optional[float]:
@@ -1031,6 +1198,12 @@ class Simulator:
             bars_held=bars_held,
             entry_type=pos.entry_type,
             entry_filters_passed=pos.entry_filters_passed,
+            phaseb_score_at_entry=pos.phaseb_score,
+            size_mult_at_entry=pos.size_mult,
+            qty_base=pos.base_qty,
+            qty_final=pos.final_qty,
+            phaseb_clipped_low=pos.phaseb_clipped_low,
+            phaseb_clipped_high=pos.phaseb_clipped_high,
         )
 
     def _close_position(
@@ -1096,4 +1269,10 @@ class Simulator:
             bars_held=bars_held,
             entry_type=pos.entry_type,
             entry_filters_passed=pos.entry_filters_passed,
+            phaseb_score_at_entry=pos.phaseb_score,
+            size_mult_at_entry=pos.size_mult,
+            qty_base=pos.base_qty,
+            qty_final=pos.final_qty,
+            phaseb_clipped_low=pos.phaseb_clipped_low,
+            phaseb_clipped_high=pos.phaseb_clipped_high,
         )

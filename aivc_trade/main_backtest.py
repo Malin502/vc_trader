@@ -246,8 +246,10 @@ def main() -> None:
         save_backtest_reports(metrics, trades, equity_curve, results_dir, candles_1h=candles_1h)
         log.info(f"Backtest reports saved → {results_dir}")
         skips = []
+        sizing_logs = []
         if hasattr(sim, "last_run_stats"):
             skips = sim.last_run_stats.get("phase_b_skips", []) or []
+            sizing_logs = sim.last_run_stats.get("phase_b_sizing", []) or []
         if skips:
             pb_cfg = cfg.get("phaseb", cfg.get("phase_b", {}))
             log_skips = bool(pb_cfg.get("log_skips", pb_cfg.get("gate", {}).get("log_skips", True)))
@@ -258,6 +260,12 @@ def main() -> None:
                 # Keep a copy in backtest results for experiment tracking.
                 pd.DataFrame(skips).to_csv(results_dir / "phaseb_skips.csv", index=False)
                 log.info(f"PhaseB skips saved → {log_path} ({len(skips)} rows)")
+        if sizing_logs:
+            log_path = Path("logs/phaseb_sizing.csv")
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(sizing_logs).to_csv(log_path, index=False)
+            pd.DataFrame(sizing_logs).to_csv(results_dir / "phaseb_sizing.csv", index=False)
+            log.info(f"PhaseB sizing logs saved → {log_path} ({len(sizing_logs)} rows)")
 
         quality_df = _data_quality_checks(candles_1h, candles_5m)
         quality_df.to_csv(results_dir / "data_quality_checks.csv", index=False)

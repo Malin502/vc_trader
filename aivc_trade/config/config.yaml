@@ -5,8 +5,16 @@
 exchange:
   name: binance
   symbols:
-    - BTCUSDC
-    - ETHUSDC
+    - BTCUSDT
+    - ETHUSDT
+    - SOLUSDT
+    - BNBUSDT
+    - XRPUSDT
+    - DOGEUSDT
+    - AVAXUSDT
+    - LINKUSDT
+    - POLUSDT
+    - LTCUSDT
   market_type: spot          # spot / futures
 
 # ---------- Strategy Direction ----------
@@ -360,7 +368,7 @@ backtest:
 
 # ---------- PhaseB Directional Filter ----------
 phaseb:
-  enabled: false
+  enabled: true
   mode: directional
   timeframe: "1h"
   horizon_bars: 24
@@ -384,8 +392,8 @@ phaseb:
       lambda_l1: 0.0
       lambda_l2: 1.0
     threshold:
-      mode: top_pct
-      top_pct: 0.15
+      mode: rank_only
+      value: 0.0
     extra_filters:
       enabled: false
 
@@ -404,9 +412,24 @@ phaseb:
       lambda_l1: 0.0
       lambda_l2: 1.0
     threshold:
-      mode: top_pct
-      top_pct: 0.10
+      mode: rank_only
+      value: 0.0
     extra_filters:
       enabled: true
       atr_pct_min: 0.008
       adx_min: 18
+
+  top_bottom_k:
+    enabled: true
+    k_long: 3
+    k_short: 3
+    long_score_min: 0.05
+    short_score_max: 0.05
+
+  sizing:
+    enabled: true
+    k: 0.3              # z-score スケーリング係数
+    min_mult: 0.7       # 最小 size 乗数 (70% of base)
+    max_mult: 1.3       # 最大 size 乗数 (130% of base)
+    rolling_window: 20  # ローリング正規化に使う直近スコア数
+    warmup_n: 5         # ウォームアップ期間（この本数に達するまで mult=1.0）
