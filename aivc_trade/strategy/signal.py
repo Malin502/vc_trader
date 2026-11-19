@@ -231,17 +231,48 @@ def check_cooldown_bars(
 # Main signal generator
 # ============================================================
 
+def _held_position_counts(
+    current_position: Optional[Position],
+    current_positions: Optional[List[Position]],
+) -> Dict[str, int]:
+    """Count open positions per symbol.
+
+    Accepts the legacy single-position argument alongside the M3 list without
+    double-counting the same object.
+    """
+    held: Dict[str, int] = {}
+    seen_ids: set = set()
+
+    for pos in list(current_positions or []):
+        if pos is None or id(pos) in seen_ids:
+            continue
+        seen_ids.add(id(pos))
+        held[pos.symbol] = held.get(pos.symbol, 0) + 1
+
+    if current_position is not None and id(current_position) not in seen_ids:
+        held[current_position.symbol] = held.get(current_position.symbol, 0) + 1
+
+    return held
+
+
 def generate_signals(
     features_1h: Dict[str, pd.DataFrame],
     features_5m: Dict[str, pd.DataFrame],
     cfg: Dict[str, Any],
     now: datetime,
     current_position: Optional[Position] = None,
+    current_positions: Optional[List[Position]] = None,
     cooldowns: Optional[Dict[str, datetime]] = None,
     cooldowns_bar: Optional[Dict[str, int]] = None,
     current_bar_idx: int = 0,
 ) -> List[Signal]:
     """Evaluate entry conditions for each symbol and return candidate signals.
+
+    The portfolio limits from ``cfg["position"]`` are enforced here so every
+    caller (live loop, backtest, tests) is protected by the same rules:
+
+    * ``max_concurrent``  – at most that many positions overall
+    * ``max_per_symbol``  – never enter a symbol that is already held
 
     Parameters
     ----------
@@ -249,27 +280,44 @@ def generate_signals(
     features_5m : {symbol: DataFrame} with computed 5m features (unused in trend version)
     cfg : full config dict
     now : current UTC datetime
-    current_position : existing position (None if flat)
-    cooldowns : {symbol: cooldown_until_dt} (legacy hour-based)
-    cooldowns_bar : {symbol: bar_index} (new bar-based cooldown)
+    current_position : legacy single existing position (None if flat)
+    current_positions : all open positions (M3; list, may be empty)
+    cooldowns : {symbol: cooldown_until_dt}
+    cooldowns_bar : {symbol: bar_index} (backtest bar-based cooldown)
     current_bar_idx : current bar index for bar-based cooldown
 
     Returns
     -------
-    List of Signal objects (0, 1, or 2). Caller picks the best.
+    List of Signal objects, best score first, capped at the number of free
+    slots (0, 1, ... ``max_concurrent``).
     """
     if cooldowns is None:
         cooldowns = {}
     if cooldowns_bar is None:
         cooldowns_bar = {}
 
-    # Block if already holding
-    if current_position is not None:
+    position_cfg = cfg.get("position", {})
+    max_concurrent = int(position_cfg.get("max_concurrent", 1))
+    max_per_symbol = int(position_cfg.get("max_per_symbol", 1))
+
+    held = _held_position_counts(current_position, current_positions)
+    open_count = sum(held.values())
+    free_slots = max_concurrent - open_count
+
+    if free_slots <= 0:
+        log.debug(
+            f"No free slot ({open_count}/{max_concurrent} in use) – no new entries"
+        )
         return []
 
     signals: List[Signal] = []
 
     for symbol in cfg["exchange"]["symbols"]:
+        # --- Gate 0: one slot per symbol (no doubled entries) ---
+        if held.get(symbol, 0) >= max_per_symbol:
+            log.debug(f"{symbol} already held – skipping (max_per_symbol={max_per_symbol})")
+            continue
+
         df_1h = features_1h.get(symbol)
         if df_1h is None or df_1h.empty:
             continue
@@ -354,6 +402,13 @@ def generate_signals(
         signals.append(sig)
         log.info(f"Signal: {symbol} type={entry_type} score={score:.4f} entry={entry_price:.2f} stop={stop_price:.2f}")
 
-    # Sort by score descending
+    # Sort by score descending, then trim to the free slots so the caller can
+    # enter every returned signal without re-checking the cap.
     signals.sort(key=lambda s: s.score, reverse=True)
+    if len(signals) > free_slots:
+        log.info(
+            f"{len(signals)} candidates for {free_slots} free slot(s) – "
+            f"keeping top {free_slots}"
+        )
+        signals = signals[:free_slots]
     return signals

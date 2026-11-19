@@ -361,6 +361,20 @@ class PositionManager:
     # ------------------------------------------------------------------
     # Exit checks
     # ------------------------------------------------------------------
+    def effective_stop(self, pos: Position) -> float:
+        """Stop level the bot would exit at on a bar close.
+
+        Single source of truth shared by :meth:`check_exit` and the live loop's
+        exchange-side safety net, so both always talk about the same price.
+        """
+        if pos.mode == "RUNNER" or pos.runner_mode:
+            if pos.runner_trail_price > 0:
+                return max(pos.stop_price, pos.runner_trail_price)
+            return pos.stop_price
+        if pos.trail_price > 0:
+            return max(pos.stop_price, pos.trail_price)
+        return pos.stop_price
+
     def check_exit(
         self,
         pos: Position,
@@ -380,11 +394,8 @@ class PositionManager:
         """
 
         # --- Stop loss / trailing stop ---
+        effective_stop = self.effective_stop(pos)
         if pos.mode == "RUNNER" or pos.runner_mode:
-            if pos.runner_trail_price > 0:
-                effective_stop = max(pos.stop_price, pos.runner_trail_price)
-            else:
-                effective_stop = pos.stop_price
             if current_close <= effective_stop:
                 if pos.runner_trail_price > 0 and pos.runner_trail_price >= pos.stop_price:
                     log.info(
@@ -399,9 +410,6 @@ class PositionManager:
                     )
                     return ExitReason.STOP_LOSS
         else:
-            effective_stop = pos.stop_price
-            if pos.trail_price > 0:
-                effective_stop = max(effective_stop, pos.trail_price)
             if current_close <= effective_stop:
                 reason = (
                     ExitReason.TRAILING_STOP
