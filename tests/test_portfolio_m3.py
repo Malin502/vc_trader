@@ -476,6 +476,43 @@ class TestMainLivePortfolioLoop:
                     "fills": [{"qty": str(qty), "price": str(prices[symbol])}],
                 }
 
+            # --- exchange-side stop surface (M4 wiring must be able to place) ---
+            def get_open_orders(self, symbol=None):
+                return []
+
+            def place_stop_order(self, **kwargs):
+                return {
+                    "orderId": "s1",
+                    "clientOrderId": kwargs.get("client_order_id"),
+                    "status": "NEW",
+                    "stopPrice": str(kwargs["stop_price"]),
+                    "origQty": str(kwargs["qty"]),
+                    "side": "SELL",
+                    "type": kwargs.get("order_type", "STOP_LOSS"),
+                }
+
+            def cancel_replace_order(self, **kwargs):
+                return {
+                    "orderId": "s2",
+                    "clientOrderId": kwargs.get("new_client_order_id"),
+                    "status": "NEW",
+                    "stopPrice": str(kwargs["stop_price"]),
+                    "origQty": str(kwargs["qty"]),
+                    "side": "SELL",
+                    "type": kwargs.get("order_type", "STOP_LOSS"),
+                }
+
+            def cancel_order(self, **kwargs):
+                return {"orderId": kwargs.get("order_id"), "status": "CANCELED"}
+
+            def get_order(self, **kwargs):
+                return {
+                    "orderId": kwargs.get("order_id"),
+                    "status": "NEW",
+                    "stopPrice": "0",
+                    "origQty": "0",
+                }
+
         def fake_features(df, cfg):
             symbol = df.attrs["symbol"]
             price = prices[symbol]

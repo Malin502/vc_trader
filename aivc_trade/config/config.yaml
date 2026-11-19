@@ -199,6 +199,10 @@ stop_order:
   order_type: STOP_LOSS      # STOP_LOSS | STOP_LOSS_LIMIT
   client_order_prefix: aivc-sl
   limit_offset_pct: 0.10     # STOP_LOSS_LIMIT 時の指値オフセット（stop から下, %）
+  # 取引所側 stop を bot の stop より何%下に置くか（安全網のクッション）。
+  # bot の手仕舞いは終値ベースなので、同じ価格に置くとザラ場のタッチで取引所側が
+  # 先に約定し、bot 側の制御が効かなくなる。0 で完全一致（＝挙動が変わる）。
+  safety_buffer_pct: 0.3
 
 # ---------- Circuit Breaker ----------
 circuit_breaker:

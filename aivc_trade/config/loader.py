@@ -296,3 +296,9 @@ def _validate_stop_order(cfg: Dict[str, Any]) -> None:
         raise ValueError(
             "Invalid config: stop_order.limit_offset_pct must satisfy 0 <= x < 100"
         )
+
+    buffer_pct = float(stop_cfg.get("safety_buffer_pct", 0.0))
+    if not (0.0 <= buffer_pct < 100.0):
+        raise ValueError(
+            "Invalid config: stop_order.safety_buffer_pct must satisfy 0 <= x < 100"
+        )
