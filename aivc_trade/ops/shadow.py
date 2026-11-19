@@ -140,11 +140,13 @@ def evaluate_reentry(
     eligible = bool(enough and positive)
 
     if not enough and not positive:
-        reason = f"件数不足（{n}/{int(min_trades)}）かつ S0 期待値が非正"
+        reason = f"件数不足（{n}/{int(min_trades)}）かつ期待値が非正"
     elif not enough:
         reason = f"件数不足（{n}/{int(min_trades)}）"
     elif not positive:
-        reason = f"S0 期待値が非正（{expectancy:+.1f} JPY/件）"
+        reason = (
+            f"期待値が非正（片道 {float(slippage_bps):g}bps 前提で {expectancy:+.1f} JPY/件）"
+        )
     else:
         reason = "再入場条件を満たした（人間の判断待ち）"
 
