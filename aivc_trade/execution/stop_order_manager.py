@@ -616,16 +616,29 @@ class StopOrderManager:
                 stop_limit_offset_pct=self._offset_pct(),
             )
         except Exception as e:
-            # STOP_ON_FAILURE keeps the old stop alive when the replacement is
-            # rejected; cancel it and place a fresh one so the position is not
-            # left with a stale stop level.
+            # cancelReplace が失敗したときの取引所側の状態は 1 通りではない:
+            # ``STOP_ON_FAILURE`` でも「新規注文の拒否」時は旧注文が取り消され、
+            # ``-2021``（cancel-replace partially failed）で返ってくる。つまり
+            # ここで何もしないと建玉が無防備になる（M4b Testnet 実走で確認）。
+            # → 新値で置き直し、それも拒否されたら直前に載っていた値で復旧する。
             log.error(
                 f"cancelReplace failed for {symbol} "
                 f"({state.stop_price} → {new_stop_price}): {e}"
             )
+            previous_stop = state.stop_price
             self._cancel_quietly(symbol, state)
             self._states.pop(symbol, None)
-            return self._place(symbol, qty, new_stop_price)
+
+            rearmed = self._place(symbol, qty, new_stop_price)
+            if rearmed is not None and rearmed.is_open:
+                return rearmed
+            if previous_stop > 0 and previous_stop != new_stop_price:
+                log.warning(
+                    f"Re-arming stop for {symbol} at previous level {previous_stop} "
+                    "after the ratchet target was rejected"
+                )
+                return self._place(symbol, qty, previous_stop)
+            return None
 
         old_stop, old_qty = state.stop_price, state.qty
         new_state = self._state_from_response(
@@ -696,6 +709,7 @@ class StopOrderManager:
             client_order_id=str(order.get("clientOrderId") or ""),
         )
         self._states[symbol] = state
+        self._bump_seq(state.client_order_id)
         log.info(
             f"Stop adopted from exchange: {symbol} qty={state.qty} "
             f"stop={state.stop_price} id={state.order_id} status={state.status}"
@@ -761,6 +775,12 @@ class StopOrderManager:
         # Keep it within Binance's 36-char limit without losing uniqueness.
         keep = _MAX_CLIENT_ORDER_ID_LEN - len(str(self._seq)) - 1
         return f"{candidate[:keep]}-{self._seq}"
+
+    def _bump_seq(self, client_order_id: str) -> None:
+        """Keep generated ids from colliding with an adopted order."""
+        tail = str(client_order_id or "").rsplit("-", 1)[-1]
+        if tail.isdigit():
+            self._seq = max(self._seq, int(tail))
 
     @staticmethod
     def _error_code(exc: Exception) -> Optional[int]:

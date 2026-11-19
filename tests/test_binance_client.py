@@ -297,6 +297,27 @@ class TestStopOrders:
         with pytest.raises(ValueError, match="Unsupported stop order type"):
             client.place_stop_order(SYMBOL, "SELL", 0.01, 1000.0, order_type="ICEBERG")
 
+    def test_place_stop_fills_missing_response_fields(self, client, session):
+        """応答に stopPrice 等が無い場合は送信した正規化値で補う（Testnet 挙動）。"""
+        session.handler = lambda method, path, query: FakeResponse(
+            200,
+            {
+                "symbol": SYMBOL,
+                "orderId": 4321,
+                "clientOrderId": query.get("newClientOrderId"),
+                "transactTime": 1_700_000_000_000,
+            },
+        )
+        resp = client.place_stop_order(
+            SYMBOL, "SELL", 0.01, 1000.3, client_order_id="cid-9"
+        )
+        assert resp["orderId"] == 4321
+        # tick 0.5 で切り上げた送信値がローカル状態の元になる
+        assert float(resp["stopPrice"]) == pytest.approx(1000.5)
+        assert float(resp["origQty"]) == pytest.approx(0.01)
+        assert resp["status"] == "NEW"
+        assert resp["type"] == "STOP_LOSS"
+
     def test_get_order_by_client_id(self, client, session):
         client.get_order(SYMBOL, client_order_id="cid-9")
         method, url, _ = session.calls[-1]
@@ -369,3 +390,65 @@ class TestStopOrders:
         with pytest.raises(BinanceAPIError) as exc:
             client.cancel_replace_order(SYMBOL, "SELL", 0.01, 1050.0, cancel_order_id=1001)
         assert exc.value.code == -2010
+
+    def test_cancel_replace_unwraps_current_envelope(self, client, session):
+        """現行の封筒（cancelResult/newOrderResponse）でも置換後の注文を返す。"""
+        session.handler = lambda method, path, query: FakeResponse(
+            200,
+            {
+                "cancelResult": "SUCCESS",
+                "newOrderResult": "SUCCESS",
+                "cancelResponse": {"orderId": 1001, "status": "CANCELED"},
+                "newOrderResponse": {
+                    "symbol": SYMBOL,
+                    "orderId": 1002,
+                    "orderListId": -1,
+                    "clientOrderId": "cid-2",
+                    "transactTime": 1_700_000_000_000,
+                },
+            },
+        )
+        resp = client.cancel_replace_order(
+            SYMBOL, "SELL", 0.01, 1050.0, cancel_order_id=1001,
+            new_client_order_id="cid-2",
+        )
+        assert resp["orderId"] == 1002
+        assert resp["clientOrderId"] == "cid-2"
+        # newOrderResponse は stopPrice / origQty / status を返さないので送信値で補う
+        assert float(resp["stopPrice"]) == pytest.approx(1050.0)
+        assert float(resp["origQty"]) == pytest.approx(0.01)
+        assert resp["status"] == "NEW"
+        assert resp["type"] == "STOP_LOSS"
+
+    def test_cancel_replace_new_order_failure_raises(self, client, session):
+        """HTTP 200 でも newOrderResult=FAILURE は成功として返さない。"""
+        session.handler = lambda method, path, query: FakeResponse(
+            200,
+            {
+                "cancelResult": "NOT_ATTEMPTED",
+                "newOrderResult": "FAILURE",
+                "cancelResponse": {},
+                "newOrderResponse": {
+                    "code": -2010,
+                    "msg": "Stop price would trigger immediately.",
+                },
+            },
+        )
+        with pytest.raises(BinanceAPIError) as exc:
+            client.cancel_replace_order(SYMBOL, "SELL", 0.01, 1050.0, cancel_order_id=1001)
+        assert exc.value.code == -2010
+        assert "trigger" in str(exc.value)
+
+    def test_cancel_replace_cancel_failure_raises(self, client, session):
+        session.handler = lambda method, path, query: FakeResponse(
+            200,
+            {
+                "cancelResult": "FAILURE",
+                "newOrderResult": "NOT_ATTEMPTED",
+                "cancelResponse": {"code": -2011, "msg": "Unknown order sent."},
+                "newOrderResponse": {},
+            },
+        )
+        with pytest.raises(BinanceAPIError) as exc:
+            client.cancel_replace_order(SYMBOL, "SELL", 0.01, 1050.0, cancel_order_id=1001)
+        assert exc.value.code == -2011

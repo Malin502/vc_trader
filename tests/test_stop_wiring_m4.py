@@ -252,6 +252,21 @@ class TestReconcile:
         assert report.needs_attention is True
         assert report.has_errors is False
 
+    def test_adopted_client_order_id_seeds_the_sequence(self):
+        """再起動後、採用済み注文と同じ clientOrderId を再生成しない。"""
+        client = FakeStopClient()
+        client.open_orders = [
+            _stop_order(SYMBOL, 4_900_000.0, 0.01, "aivc-sl-BTCJPY-7")
+        ]
+        mgr = _manager(client)
+        mgr.reconcile({SYMBOL: FakePosition()}, steps={SYMBOL: 1e-5})
+
+        mgr.update_stop(FakePosition(stop_price=5_000_000.0), 5_000_000.0)
+
+        assert (
+            client.call("cancel_replace")["new_client_order_id"] == "aivc-sl-BTCJPY-8"
+        )
+
     def test_cancels_an_orphan_stop(self):
         client = FakeStopClient()
         client.open_orders = [

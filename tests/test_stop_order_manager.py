@@ -94,6 +94,21 @@ class FakeStopClient:
         raise AssertionError(f"no {kind} call recorded: {self.kinds()}")
 
 
+class _RejectingPlaceClient(FakeStopClient):
+    """``place_stop_order`` が指定価格だけを拒否する（取引所の filter 拒否を模す）。"""
+
+    def __init__(self, reject_price: float) -> None:
+        super().__init__()
+        self.reject_price = reject_price
+        self.placed_prices = []
+
+    def place_stop_order(self, **kwargs):
+        self.placed_prices.append(kwargs["stop_price"])
+        if kwargs["stop_price"] == self.reject_price:
+            raise BinanceAPIError(-2010, "Stop price would trigger immediately", 400)
+        return super().place_stop_order(**kwargs)
+
+
 def _manager(client, **cfg_overrides):
     cfg = {
         "stop_order": {
@@ -331,6 +346,24 @@ class TestRatchet:
 
         assert client.kinds() == ["place", "cancel_replace", "cancel", "place"]
         assert state.stop_price == pytest.approx(9_900_000.0)
+
+    def test_ratchet_rejection_rearms_at_previous_level(self):
+        """-2021（新規拒否）で旧 stop が消えた場合も無防備にしない。"""
+        client = _RejectingPlaceClient(reject_price=9_900_000.0)
+        mgr = _manager(client)
+        pos = FakePosition()
+        mgr.place_initial_stop(pos)  # 9_700_000.0
+        client.replace_error = BinanceAPIError(
+            -2021, "Order cancel-replace partially failed", 409
+        )
+
+        state = mgr.update_stop(pos, 9_900_000.0)
+
+        # 新値は取引所に拒否されたので、直前に載っていた水準で復旧する
+        assert client.placed_prices == [9_700_000.0, 9_900_000.0, 9_700_000.0]
+        assert state is not None
+        assert state.stop_price == pytest.approx(9_700_000.0)
+        assert mgr.is_protected("BTCJPY") is True
 
 
 # ============================================================

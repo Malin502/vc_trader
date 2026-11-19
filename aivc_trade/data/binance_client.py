@@ -415,7 +415,17 @@ class BinanceClient:
             params["timeInForce"] = time_in_force
         if client_order_id:
             params["newClientOrderId"] = client_order_id
-        return self._signed_request("POST", "/api/v3/order", params)
+        resp = self._signed_request("POST", "/api/v3/order", params)
+        # 取引所は注文応答に stopPrice / origQty / status を返さないことがある
+        # （Testnet で確認）。補わないと呼び出し側のローカル状態が tickSize 丸め前の
+        # 値でずれ、取引所の実体と一致しなくなる。
+        if isinstance(resp, dict):
+            resp.setdefault("stopPrice", params["stopPrice"])
+            resp.setdefault("origQty", params["quantity"])
+            resp.setdefault("side", side)
+            resp.setdefault("type", order_type)
+            resp.setdefault("status", "NEW")
+        return resp
 
     def get_order(
         self,
@@ -513,6 +523,45 @@ class BinanceClient:
             params["newClientOrderId"] = new_client_order_id
 
         resp = self._signed_request("POST", "/api/v3/order/cancelReplace", params)
+        # 取引所は 2 種類の封筒を返す:
+        #   {"code": 200, "msg": ..., "data": {...}}                        （旧ドキュメント）
+        #   {"cancelResult", "newOrderResult", "cancelResponse", "newOrderResponse"}（現行）
+        # 現行の封筒を ``data`` 前提で扱うと orderId / stopPrice を失い、置換後の
+        # ローカル状態が「注文 ID 不明・stop 価格は丸め前」になる（M4b Testnet 実走で観測）。
+        # 200 応答でも newOrderResult が FAILURE なら成功として返してはいけない。
+        if isinstance(resp, dict) and (
+            "newOrderResult" in resp or "cancelResult" in resp
+        ):
+            cancel_result = str(resp.get("cancelResult") or "").upper()
+            new_result = str(resp.get("newOrderResult") or "").upper()
+            new_payload = dict(resp.get("newOrderResponse") or {})
+            if cancel_result == "FAILURE":
+                cancel_payload = resp.get("cancelResponse") or {}
+                raise BinanceAPIError(
+                    cancel_payload.get("code"),
+                    cancel_payload.get("msg") or "cancelReplace cancel failed",
+                    200,
+                    "POST",
+                    "/api/v3/order/cancelReplace",
+                )
+            if new_result and new_result != "SUCCESS":
+                raise BinanceAPIError(
+                    new_payload.get("code"),
+                    new_payload.get("msg")
+                    or f"cancelReplace new order failed ({new_result})",
+                    200,
+                    "POST",
+                    "/api/v3/order/cancelReplace",
+                )
+            # newOrderResponse は orderId など最小限しか返さないため、送信した
+            # 正規化済みの値（stepSize / tickSize 適用後）で補って注文ペイロードにする。
+            new_payload.setdefault("stopPrice", params["stopPrice"])
+            new_payload.setdefault("origQty", params["quantity"])
+            new_payload.setdefault("side", params["side"])
+            new_payload.setdefault("type", params["type"])
+            new_payload.setdefault("status", "NEW")
+            return new_payload
+
         # Success envelope: {"code": 200, "msg": "...", "data": {...}}.
         # A 200 response may still carry an error code when the cancel succeeded
         # but the replacement was rejected (ALLOW_FAILURE).
