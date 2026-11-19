@@ -208,6 +208,7 @@ class StopOrderManager:
         cfg: Optional[Dict[str, Any]] = None,
         now_fn: Optional[Callable[[], datetime]] = None,
         tolerance_pct: float = 0.0,
+        alert_fn: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.client = client
         self.cfg = cfg or {}
@@ -221,6 +222,14 @@ class StopOrderManager:
         #: the bot's own exit level leaves the bot's control authoritative and
         #: the exchange order a genuine safety net (0.0 = mirror exactly).
         self.safety_buffer_pct = float(stop_cfg.get("safety_buffer_pct", 0.0))
+        #: ラチェット失敗が連続 N 回続いたら、握りつぶさず通知する（M4b 持ち越し）。
+        #: 1 回の失敗は復旧処理で吸収されるが、連続する場合は「毎ループ失敗し
+        #: 続けている」＝ stop が追随していない状態なので、人間が気づく必要がある。
+        self.ratchet_alert_after = max(1, int(stop_cfg.get("ratchet_alert_after", 3)))
+        self._alert_fn = alert_fn
+        #: symbol -> 連続失敗回数 / 直近に通知した回数
+        self._ratchet_failures: Dict[str, int] = {}
+        self._ratchet_alerted_at: Dict[str, int] = {}
 
         self._now_fn = now_fn or _now_utc
         self._tolerance_pct = float(tolerance_pct)
@@ -230,6 +239,10 @@ class StopOrderManager:
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
+    def ratchet_failures(self, symbol: str) -> int:
+        """Consecutive cancelReplace failures for *symbol* (0 after a success)."""
+        return int(self._ratchet_failures.get(symbol, 0))
+
     def get_state(self, symbol: str) -> Optional[StopOrderState]:
         return self._states.get(symbol)
 
@@ -301,11 +314,15 @@ class StopOrderManager:
 
         state = self._states.get(position.symbol)
         if state is None:
-            return self._place(position.symbol, position.qty, new_stop_price)
+            return self._count_stop_outcome(
+                position.symbol, self._place(position.symbol, position.qty, new_stop_price)
+            )
         if not state.is_open:
             if self._already_filled(position.symbol):
                 return state
-            return self._place(position.symbol, position.qty, new_stop_price)
+            return self._count_stop_outcome(
+                position.symbol, self._place(position.symbol, position.qty, new_stop_price)
+            )
 
         if not self._should_ratchet(state, new_stop_price):
             log.debug(
@@ -314,7 +331,10 @@ class StopOrderManager:
             )
             return state
 
-        return self._ratchet(position.symbol, position.qty, new_stop_price)
+        return self._count_stop_outcome(
+            position.symbol,
+            self._ratchet(position.symbol, position.qty, new_stop_price),
+        )
 
     # ------------------------------------------------------------------
     # Resize (quantity follows the position)
@@ -346,7 +366,10 @@ class StopOrderManager:
             return None
         if _qty_close(state.qty, target, step):
             return state
-        return self._ratchet(position.symbol, target, state.stop_price)
+        return self._count_stop_outcome(
+            position.symbol,
+            self._ratchet(position.symbol, target, state.stop_price),
+        )
 
     # ------------------------------------------------------------------
     # Cancel / sync
@@ -655,6 +678,57 @@ class StopOrderManager:
             f"id={new_state.order_id} status={new_state.status}"
         )
         return new_state
+
+    def _count_stop_outcome(
+        self, symbol: str, state: Optional[StopOrderState], detail: str = ""
+    ) -> Optional[StopOrderState]:
+        """Feed one attempted stop update into the consecutive-failure counter.
+
+        Every path that *tries* to keep the exchange stop in place (place,
+        ratchet, resize) ends here, so a stop that disappeared and cannot be
+        re-placed also counts — that is exactly the case the escalation is for.
+        """
+        ok = state is not None and state.is_open
+        self._note_ratchet_outcome(
+            symbol, ok=ok, detail=detail or ("" if ok else "stop not open after update")
+        )
+        return state
+
+    def _note_ratchet_outcome(self, symbol: str, *, ok: bool, detail: str = "") -> None:
+        """Track consecutive cancelReplace failures and escalate when they pile up.
+
+        A single failure is absorbed by the re-arm path (guarded by tests); what
+        must not go unnoticed is *repeating* failure — the stop is then no longer
+        following the trail, so the position is protected at a stale level.  The
+        alert fires on every ``ratchet_alert_after``-th consecutive failure so it
+        is loud without flooding the channel.
+        """
+        if ok:
+            if self._ratchet_failures.pop(symbol, 0):
+                log.info(f"Ratchet recovered for {symbol}")
+            self._ratchet_alerted_at.pop(symbol, None)
+            return
+
+        count = self._ratchet_failures.get(symbol, 0) + 1
+        self._ratchet_failures[symbol] = count
+        log.warning(f"Ratchet failure #{count} for {symbol}: {detail}")
+        if count < self.ratchet_alert_after or count % self.ratchet_alert_after:
+            return
+        if self._ratchet_alerted_at.get(symbol) == count:
+            return
+        self._ratchet_alerted_at[symbol] = count
+        message = (
+            f"STOP ratchet failing repeatedly: {symbol} "
+            f"({count} consecutive cancelReplace failures). "
+            f"Exchange stop is not following the trail – check the position. "
+            f"last={detail}"
+        )
+        log.error(message)
+        if self._alert_fn is not None:
+            try:
+                self._alert_fn(message)
+            except Exception as e:  # 通知失敗で運用を止めない
+                log.error(f"Ratchet escalation alert failed: {e}")
 
     def _cancel_quietly(self, symbol: str, state: StopOrderState) -> None:
         try:

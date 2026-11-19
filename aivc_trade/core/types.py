@@ -154,6 +154,13 @@ class Order:
     ts: Optional[datetime] = None
     order_id: Optional[str] = None
     filled_price: Optional[float] = None
+    #: 実際に約定した数量（部分約定を含む）。``qty`` は発注数量。
+    filled_qty: Optional[float] = None
+    #: 約定の合計手数料と、その建て通貨（Binance は base/quote どちらかで返す）。
+    fee: float = 0.0
+    fee_asset: str = ""
+    #: 約定代金の合計（cummulativeQuoteQty）。平均約定価格の算出に使う。
+    quote_qty: float = 0.0
     status: str = "NEW"
 
 
