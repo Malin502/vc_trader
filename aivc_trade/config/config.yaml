@@ -4,9 +4,19 @@
 
 exchange:
   name: binance
+  # prod | testnet — loader.resolve_base_url() が接続先を切り替える
+  env: prod
+  # prod 用 API ホスト。Binance Japan は api.binance.co.jp の可能性があるが、
+  # 自宅回線から TCP 接続が成立しないため未確定。デプロイ時に必ず設定する
+  # （未設定のまま resolve_base_url() を呼ぶと ValueError）。
+  base_url: ""
+  testnet_base_url: "https://testnet.binance.vision"
+  quote_asset: JPY            # 建て通貨（残高取得・base asset 判定に使用）
   symbols:
-    - BTCUSDC
-    - ETHUSDC
+    - BTCJPY
+    - ETHJPY
+    - XRPJPY
+    - SOLJPY
   market_type: spot          # 現物のみ
 
 timeframes:
@@ -15,7 +25,8 @@ timeframes:
   monitor: 5m                # ストップ更新監視足
 
 position:
-  max_concurrent: 2          # 同時保有最大数
+  max_concurrent: 2          # 同時保有最大数（合計2枠）
+  max_per_symbol: 1          # 同一銘柄の同時保有上限
   cooldown_hours: 24         # 決済後の再エントリ禁止(h) ※後方互換用
   stop_loss_cooldown_hours: 48
   regime_exit_cooldown_hours: 24
@@ -162,9 +173,13 @@ exit_tuning:
     apply_to_core: true
 
 # ---------- Position Sizing ----------
+# 新仕様 v2: 1トレードあたりリスクは ペーパー期 2% / 実弾初期 1%。
+# risk_mode で切り替え、loader が sizing.risk_per_trade に実効値を注入する。
 sizing:
-  risk_per_trade: 0.08       # 口座資産の 8%（高リスク高リターン）
-  max_notional_pct: 1.00     # 最大投下比率
+  risk_mode: paper           # paper | live
+  risk_per_trade_paper: 0.02 # 口座資産の 2%（ペーパー期）
+  risk_per_trade_live: 0.01  # 口座資産の 1%（実弾初期）
+  max_notional_pct: 0.50     # 1枠あたり投下比率ガード
 
 # ---------- Symbol Score Weights ----------
 score:
@@ -176,6 +191,13 @@ score:
 order:
   type: MARKET               # MARKET / LIMIT
   max_entry_slippage_bps: 15
+
+# ---------- Exchange-side Stop Orders (M2 基盤・main_live へは未結線) ----------
+stop_order:
+  enabled: true
+  order_type: STOP_LOSS      # STOP_LOSS | STOP_LOSS_LIMIT
+  client_order_prefix: aivc-sl
+  limit_offset_pct: 0.10     # STOP_LOSS_LIMIT 時の指値オフセット（stop から下, %）
 
 # ---------- Circuit Breaker ----------
 circuit_breaker:
@@ -199,7 +221,7 @@ persistence:
 # ---------- Backtest ----------
 backtest:
   data_dir: data/candles
-  initial_equity: 100000.0    # USDC
+  initial_equity: 100000.0    # JPY
   start_date: "2023-03-13"
   end_date: "2025-12-31"
   walkforward: false          # true: walk-forward分析を実行

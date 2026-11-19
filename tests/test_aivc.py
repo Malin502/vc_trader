@@ -328,12 +328,13 @@ class TestRegimeHysteresis:
 # ============================================================
 
 class TestSizing:
-    def test_risk_5_percent(self, sample_config):
+    def test_risk_per_trade_cap(self, sample_config):
+        """Risk per trade must stay within the configured paper-mode 2%."""
         from aivc_trade.strategy.sizing import compute_qty
         from aivc_trade.core.types import Signal, Side
         sig = Signal(
             ts=datetime.now(timezone.utc),
-            symbol="BTCUSDC",
+            symbol="BTCJPY",
             side=Side.BUY,
             entry_price=50000.0,
             stop_price=48000.0,
@@ -341,28 +342,30 @@ class TestSizing:
         equity = 10000.0
         qty = compute_qty(sig, equity, sample_config, lot_step=0.00001, min_qty=0.00001)
         max_loss = qty * (sig.entry_price - sig.stop_price)
-        assert max_loss <= equity * 0.05 + 0.01
+        assert sample_config["sizing"]["risk_per_trade"] == 0.02
+        assert max_loss <= equity * 0.02 + 0.01
 
     def test_max_notional_cap(self, sample_config):
         from aivc_trade.strategy.sizing import compute_qty
         from aivc_trade.core.types import Signal, Side
         sig = Signal(
             ts=datetime.now(timezone.utc),
-            symbol="BTCUSDC",
+            symbol="BTCJPY",
             entry_price=50000.0,
             stop_price=49990.0,
         )
         equity = 10000.0
         qty = compute_qty(sig, equity, sample_config, lot_step=0.00001, min_qty=0.00001)
         notional = qty * sig.entry_price
-        assert notional <= equity * 0.95 + 0.01
+        # Per-slot guard is max_notional_pct = 0.5 (two slots per account).
+        assert notional <= equity * 0.50 + 0.01
 
     def test_zero_stop_distance(self, sample_config):
         from aivc_trade.strategy.sizing import compute_qty
         from aivc_trade.core.types import Signal, Side
         sig = Signal(
             ts=datetime.now(timezone.utc),
-            symbol="BTCUSDC",
+            symbol="BTCJPY",
             entry_price=50000.0,
             stop_price=50000.0,
         )
@@ -448,35 +451,36 @@ class TestPositionManager:
 
 class TestBreakEven:
     def test_be_activates_at_mfe_threshold(self, sample_config):
-        """Stop moves to entry + fee_buffer when MFE >= be_activate_pct."""
+        """Stop moves to entry + buffer once MFE >= 0.8% (current config)."""
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
         pos = Position(
-            symbol="BTCUSDC", qty=0.1, entry_price=50000,
+            symbol="BTCJPY", qty=0.1, entry_price=50000,
             stop_price=48000, highest_price=50000, lowest_price=50000,
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000,
         )
-        # MFE needs to reach 2.0% = +1000 → price 51000
+        # BE threshold is activate_mfe_pct = 0.8% → +400 = 50400
         pos = pm.update_stop(pos, 51100, 1000)  # MFE=2.2%
-        # Stop should be at entry + fee_buffer
-        fee_buffer = 50000 * 8 / 10000  # 8 bps = 40
-        assert pos.stop_price >= 50000 + fee_buffer - 0.01
+        # Stop should be entry + buffer_pct 0.05% = 50025
+        assert pos.stop_price == pytest.approx(50025.0)
+        assert pos.breakeven_done is True
 
     def test_be_does_not_activate_below_threshold(self, sample_config):
-        """Stop stays at initial SL when MFE < be_activate_pct."""
+        """Stop stays at initial SL when MFE < be_activate_pct (0.8%)."""
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
         pos = Position(
-            symbol="BTCUSDC", qty=0.1, entry_price=50000,
+            symbol="BTCJPY", qty=0.1, entry_price=50000,
             stop_price=48000, highest_price=50000, lowest_price=50000,
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000,
         )
-        pos = pm.update_stop(pos, 50500, 1000)  # MFE=1.0%
+        pos = pm.update_stop(pos, 50300, 1000)  # MFE=0.6% < 0.8%
         assert pos.stop_price == 48000
+        assert pos.breakeven_done is False
 
 
 # ============================================================
@@ -625,26 +629,26 @@ class TestChaosHandling:
 # ============================================================
 
 class TestPartialTP:
-    def test_partial_tp_triggers_at_3_5_percent(self, sample_config):
+    def test_partial_tp_triggers_at_config_threshold(self, sample_config):
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
         pos = Position(
-            symbol="BTCUSDC", qty=0.1, entry_price=50000,
+            symbol="BTCJPY", qty=0.1, entry_price=50000,
             stop_price=48000, initial_qty=0.1,
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, highest_price=50000, lowest_price=50000,
         )
-        # +3.5% = 51750
-        assert pm.check_partial_tp(pos, 51750) is True
+        # Current config: threshold_pct = 4.2% → 50000 * 1.042 = 52100
+        assert pm.check_partial_tp(pos, 52100) is True
 
-    def test_partial_tp_does_not_trigger_at_2_percent(self, sample_config):
+    def test_partial_tp_does_not_trigger_below_threshold(self, sample_config):
         """Partial TP should NOT trigger at 2% (old threshold)."""
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
         pos = Position(
-            symbol="BTCUSDC", qty=0.1, entry_price=50000,
+            symbol="BTCJPY", qty=0.1, entry_price=50000,
             stop_price=48000, initial_qty=0.1,
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, highest_price=50000, lowest_price=50000,
@@ -656,7 +660,7 @@ class TestPartialTP:
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
         pos = Position(
-            symbol="BTCUSDC", qty=0.05, entry_price=50000,
+            symbol="BTCJPY", qty=0.05, entry_price=50000,
             stop_price=48000, initial_qty=0.1, partial_taken=True,
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, highest_price=51500, lowest_price=50000,
@@ -669,21 +673,22 @@ class TestPartialTP:
 # ============================================================
 
 class TestRunnerMode:
-    def test_runner_trail_uses_atr_k_3(self, sample_config):
-        """Runner trailing stop = peak - ATR * 3.0."""
+    def test_runner_trail_uses_config_atr_k(self, sample_config):
+        """Runner trail = peak - ATR * k, k from two-stage config (3.5 below 6% MFE)."""
         from aivc_trade.execution.position_manager import PositionManager
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
         pos = Position(
-            symbol="BTCUSDC", qty=0.05, entry_price=50000,
-            stop_price=48000, initial_qty=0.1, highest_price=51500,
+            symbol="BTCJPY", qty=0.05, entry_price=50000,
+            stop_price=48000, initial_qty=0.1, highest_price=52500,
             partial_taken=True, runner_mode=True, mode="RUNNER",
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, lowest_price=50000,
         )
-        # Trail = 51500 - 3.0*500 = 50000
-        pos = pm.update_stop(pos, 51500, 500)
-        assert pos.runner_trail_price == pytest.approx(50000.0)
+        # MFE=5.0% >= trail_activate_mfe_pct 4.5 and < mfe_switch_pct 6.0
+        # → atr_k_before 3.5 → 52500 - 1750 = 50750
+        pos = pm.update_stop(pos, 52500, 500)
+        assert pos.runner_trail_price == pytest.approx(50750.0)
 
     def test_runner_trail_only_ratchets_up(self, sample_config):
         """Runner trail never decreases, even with higher ATR."""
@@ -691,18 +696,18 @@ class TestRunnerMode:
         from aivc_trade.core.types import Position
         pm = PositionManager(sample_config)
         pos = Position(
-            symbol="BTCUSDC", qty=0.05, entry_price=50000,
-            stop_price=48000, initial_qty=0.1, highest_price=51500,
+            symbol="BTCJPY", qty=0.05, entry_price=50000,
+            stop_price=48000, initial_qty=0.1, highest_price=52500,
             partial_taken=True, runner_mode=True, mode="RUNNER",
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, lowest_price=50000,
         )
-        # First: trail = 51500 - 3.0*500 = 50000
-        pos = pm.update_stop(pos, 51500, 500)
+        # First: trail = 52500 - 3.5*500 = 50750
+        pos = pm.update_stop(pos, 52500, 500)
         first_trail = pos.runner_trail_price
-        assert first_trail == pytest.approx(50000.0)
+        assert first_trail == pytest.approx(50750.0)
 
-        # Second: higher ATR would compute 51500 - 3.0*800 = 49100 — should NOT decrease
+        # Second: higher ATR would compute 52500 - 3.5*800 = 49700 — should NOT decrease
         pos = pm.update_stop(pos, 51400, 800)
         assert pos.runner_trail_price == first_trail
 
@@ -711,15 +716,15 @@ class TestRunnerMode:
         from aivc_trade.core.types import ExitReason, Position, Regime
         pm = PositionManager(sample_config)
         pos = Position(
-            symbol="BTCUSDC", qty=0.05, entry_price=50000,
+            symbol="BTCJPY", qty=0.05, entry_price=50000,
             stop_price=48000, initial_qty=0.1, highest_price=51500,
             partial_taken=True, runner_mode=True, mode="RUNNER",
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, lowest_price=50000,
         )
-        pos = pm.update_stop(pos, 51500, 500)  # trail = 51500 - 3*500 = 50000
-        # BE moved stop to ~50040 (entry + 8bps buffer)
-        # effective_stop = max(50040, 50000) = 50040
+        pos = pm.update_stop(pos, 51500, 500)  # trail = 51500 - 3.5*500 = 49750
+        # BE moved stop to 50025 (entry + 0.05% buffer)
+        # effective_stop = max(50025, 49750) = 50025
         # Price drops below both → exit triggered (STOP_LOSS from BE)
         result = pm.check_exit(pos, 49900, 500, Regime.TREND_UP,
                                datetime(2024, 1, 1, 12, tzinfo=timezone.utc))
@@ -731,15 +736,16 @@ class TestRunnerMode:
         from aivc_trade.core.types import ExitReason, Position, Regime
         pm = PositionManager(sample_config)
         pos = Position(
-            symbol="BTCUSDC", qty=0.05, entry_price=50000,
+            symbol="BTCJPY", qty=0.05, entry_price=50000,
             stop_price=48000, initial_qty=0.1, highest_price=53000,
             partial_taken=True, runner_mode=True, mode="RUNNER",
             entry_ts=datetime(2024, 1, 1, tzinfo=timezone.utc),
             atr_at_entry=1000, lowest_price=50000,
         )
-        # Trail = 53000 - 3*500 = 51500, well above BE (50040)
+        # MFE=6.0% >= mfe_switch_pct → atr_k_after 2.7 → 53000 - 1350 = 51650
+        # (well above BE stop 50025)
         pos = pm.update_stop(pos, 53000, 500)
-        assert pos.runner_trail_price == pytest.approx(51500.0)
+        assert pos.runner_trail_price == pytest.approx(51650.0)
         result = pm.check_exit(pos, 51400, 500, Regime.TREND_UP,
                                datetime(2024, 1, 1, 12, tzinfo=timezone.utc))
         assert result == ExitReason.TRAILING_STOP_RUNNER
@@ -1171,8 +1177,12 @@ class TestConfig:
         from aivc_trade.config.loader import load_config
         cfg = load_config()
         assert "exchange" in cfg
-        assert "BTCUSDC" in cfg["exchange"]["symbols"]
-        assert cfg["sizing"]["risk_per_trade"] == 0.05
+        assert "BTCJPY" in cfg["exchange"]["symbols"]
+        assert cfg["exchange"]["symbols"] == ["BTCJPY", "ETHJPY", "XRPJPY", "SOLJPY"]
+        assert cfg["exchange"]["env"] == "prod"
+        assert cfg["exchange"]["quote_asset"] == "JPY"
+        assert cfg["sizing"]["risk_mode"] == "paper"
+        assert cfg["sizing"]["risk_per_trade"] == 0.02
         assert cfg["costs"]["roundtrip_cost_bps"] == 30
 
     def test_new_config_keys(self):
@@ -1190,20 +1200,20 @@ class TestConfig:
         assert "cooldown_bars" in cfg["entry"]
         assert "trigger" in cfg["entry"]
         assert cfg["entry"]["trigger"] == "breakout"
-        assert cfg["entry"]["cooldown_bars"] == 36
+        assert cfg["entry"]["cooldown_bars"] == 24
         # Risk
         assert "sl_atr_k" in cfg["risk"]
         assert "be_activate_pct" in cfg["risk"]
         assert cfg["risk"]["be_activate_pct"] == 1.5
         assert "fee_buffer_bps" in cfg["risk"]
         # Entry quality
-        assert cfg["entry_quality"]["min_adx"] == 28
+        assert cfg["entry_quality"]["min_adx"] == 25
         assert cfg["entry_quality"]["adx_strict_gt"] is True
         # Partial TP
-        assert cfg["partial_tp"]["threshold_pct"] == 3.5
-        assert cfg["partial_tp"]["ratio"] == 0.33
+        assert cfg["partial_tp"]["threshold_pct"] == 4.2
+        assert cfg["partial_tp"]["ratio"] == 0.20
         # Runner
-        assert cfg["runner"]["trail_atr_k"] == 3.0
+        assert cfg["runner"]["trail_atr_k"] == 3.8
         assert cfg["runner"]["range_exit_confirm_bars"] == 10
         assert cfg["runner"]["chaos_tighten_k"] == 1.5
 

@@ -1,10 +1,11 @@
-"""Position sizing – 5% risk limit per trade, lot rounding."""
+"""Position sizing – per-trade risk limit, lot rounding."""
 
 from __future__ import annotations
 
 import math
 from typing import Any, Dict
 
+from aivc_trade.config.loader import resolve_risk_per_trade
 from aivc_trade.core.types import Signal
 from aivc_trade.core.logger import get_logger
 
@@ -26,12 +27,16 @@ def compute_qty(
     lot_step: float = 0.00001,
     min_qty: float = 0.0,
 ) -> float:
-    """Compute order quantity respecting the 5% risk limit.
+    """Compute order quantity respecting the per-trade risk limit.
+
+    The risk fraction comes from ``sizing.risk_per_trade`` (injected by the
+    loader from ``risk_mode`` / ``risk_per_trade_{paper,live}``); a raw config
+    dict without that key falls back to the same resolution rule.
 
     Parameters
     ----------
     signal : Signal with entry_price and stop_price
-    equity : current USDC equity
+    equity : current quote-asset equity (JPY)
     cfg : full config dict
     lot_step : exchange LOT_SIZE stepSize
     min_qty : exchange LOT_SIZE minQty
@@ -40,7 +45,8 @@ def compute_qty(
     -------
     Rounded quantity (0.0 if invalid / too small).
     """
-    risk_per_trade = equity * cfg["sizing"]["risk_per_trade"]
+    risk_pct_cfg = resolve_risk_per_trade(cfg.get("sizing", {}))
+    risk_per_trade = equity * risk_pct_cfg
     stop_dist = signal.entry_price - signal.stop_price
 
     if stop_dist <= 0:

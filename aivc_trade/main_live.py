@@ -83,6 +83,9 @@ def main() -> None:
     api_secret = cfg.get("secrets", {}).get("api_secret", os.environ.get("BINANCE_API_SECRET", ""))
 
     client = BinanceClient(api_key=api_key, api_secret=api_secret)
+    # Quote asset is config-driven so the symbol set can change (JPY pairs) without
+    # touching the loop. Default keeps the historical USDC behaviour.
+    quote_asset = str(cfg.get("exchange", {}).get("quote_asset", "USDC"))
     store = CandlesStore(cfg["persistence"]["candles_dir"])
     om = OrderManager(cfg)
     pm = PositionManager(cfg)
@@ -104,7 +107,11 @@ def main() -> None:
     # --- Reconcile position with exchange (起動時照合) ---
     if position:
         try:
-            base = position.symbol.replace("USDC", "")
+            base = (
+                position.symbol[: -len(quote_asset)]
+                if position.symbol.endswith(quote_asset)
+                else position.symbol
+            )
             actual_qty = client.get_spot_balance(base)
             if actual_qty < position.qty * 0.95:
                 log.warning(
@@ -280,9 +287,9 @@ def main() -> None:
                             cooldowns[sym] = pm.compute_cooldown(now, cooldown_hours)
 
                             # Equity snapshot
-                            usdc_balance = client.get_account_balance("USDC")
+                            quote_balance = client.get_account_balance(quote_asset)
                             state.equity_snapshots.append(
-                                {"ts": now.isoformat(), "equity": usdc_balance}
+                                {"ts": now.isoformat(), "equity": quote_balance}
                             )
 
                             # Circuit breaker check
@@ -308,7 +315,7 @@ def main() -> None:
                 if signals:
                     best = signals[0]
                     li = lot_info.get(best.symbol, {})
-                    equity = client.get_account_balance("USDC")
+                    equity = client.get_account_balance(quote_asset)
 
                     qty = compute_qty(
                         best, equity, cfg,
