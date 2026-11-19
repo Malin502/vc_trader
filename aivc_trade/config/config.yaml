@@ -6,10 +6,11 @@ exchange:
   name: binance
   # prod | testnet — loader.resolve_base_url() が接続先を切り替える
   env: prod
-  # prod 用 API ホスト。Binance Japan は api.binance.co.jp の可能性があるが、
-  # 自宅回線から TCP 接続が成立しないため未確定。デプロイ時に必ず設定する
-  # （未設定のまま resolve_base_url() を呼ぶと ValueError）。
-  base_url: ""
+  # prod 用 API ホスト。Binance Japan の公式サービスはグローバル基盤
+  # (binance.com/ja) 上にあり、API も api.binance.com が正。
+  # （binance.co.jp はお名前.com の駐車ドメインで、api.binance.co.jp は
+  #   実在しないホストだったため M2 の空欄をここで確定した）
+  base_url: "https://api.binance.com"
   testnet_base_url: "https://testnet.binance.vision"
   quote_asset: JPY            # 建て通貨（残高取得・base asset 判定に使用）
   symbols:

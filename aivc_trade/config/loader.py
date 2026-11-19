@@ -98,11 +98,11 @@ def resolve_risk_per_trade(sizing_cfg: Dict[str, Any]) -> float:
 def resolve_base_url(cfg: Dict[str, Any]) -> str:
     """Return the API base URL for the configured ``exchange.env``.
 
-    ``prod`` reads ``exchange.base_url`` (deliberately left unset until the
-    Binance Japan host is confirmed), ``testnet`` reads
-    ``exchange.testnet_base_url``.  Raises ``ValueError`` when the selected
-    host is missing so a misconfigured deployment fails fast instead of
-    silently trading against the wrong venue.
+    ``prod`` reads ``exchange.base_url`` (``https://api.binance.com`` — Binance
+    Japan runs on the global platform, so the global API host is correct),
+    ``testnet`` reads ``exchange.testnet_base_url``.  Raises ``ValueError`` when
+    the selected host is missing so a misconfigured deployment fails fast
+    instead of silently trading against the wrong venue.
     """
     exchange = cfg.get("exchange", {})
     env = str(exchange.get("env") or "prod").strip().lower()

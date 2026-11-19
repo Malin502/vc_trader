@@ -264,15 +264,21 @@ class BinanceClient:
         raise ValueError(f"Symbol {symbol} not found in exchangeInfo")
 
     def get_lot_size(self, symbol: str) -> Dict[str, float]:
-        """Return {minQty, maxQty, stepSize} for *symbol*."""
+        """Return {minQty, maxQty, stepSize, minNotional} for *symbol*.
+
+        ``minNotional`` comes from the NOTIONAL filter (older exchanges expose
+        MIN_NOTIONAL); it is 0.0 when the venue does not publish one.
+        """
         filters = self._get_filters(symbol)
         lot = filters.get("LOT_SIZE")
         if lot is None:
             raise ValueError(f"LOT_SIZE filter not found for {symbol}")
+        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL") or {}
         return {
             "minQty": float(lot.get("minQty", 0.0)),
             "maxQty": float(lot.get("maxQty", 0.0)),
             "stepSize": float(lot.get("stepSize", 0.0)),
+            "minNotional": float(notional.get("minNotional", 0.0)),
         }
 
     def get_price_tick(self, symbol: str) -> float:

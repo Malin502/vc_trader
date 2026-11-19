@@ -1,7 +1,8 @@
 """AIVC Trade – Live trading main loop (Phase A).
 
 Runs as a persistent process. Monitors 1h/5m candles, generates signals,
-manages positions, and persists state for restart recovery.
+manages up to ``position.max_concurrent`` positions (2 slots, one per symbol),
+and persists state for restart recovery.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import sys
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 # Allow `python aivc_trade/main_live.py` from any cwd.
 if __package__ in (None, ""):
@@ -70,6 +71,13 @@ def _get_cooldown_hours(exit_reason: ExitReason, cfg: Dict[str, Any]) -> int:
     return int(cfg["position"]["cooldown_hours"])
 
 
+def _base_asset(symbol: str, quote_asset: str) -> str:
+    """Strip the quote asset from *symbol* (BTCJPY → BTC)."""
+    if quote_asset and symbol.endswith(quote_asset):
+        return symbol[: -len(quote_asset)]
+    return symbol
+
+
 def main() -> None:
     setup_logger()
     cfg = load_config()
@@ -86,6 +94,8 @@ def main() -> None:
     # Quote asset is config-driven so the symbol set can change (JPY pairs) without
     # touching the loop. Default keeps the historical USDC behaviour.
     quote_asset = str(cfg.get("exchange", {}).get("quote_asset", "USDC"))
+    symbols: List[str] = list(cfg["exchange"]["symbols"])
+    max_concurrent = int(cfg.get("position", {}).get("max_concurrent", 1))
     store = CandlesStore(cfg["persistence"]["candles_dir"])
     om = OrderManager(cfg)
     pm = PositionManager(cfg)
@@ -95,44 +105,60 @@ def main() -> None:
     notifier = DiscordNotifier(cfg["notification"]["discord_webhook_url"])
     state_mgr = StateManager(cfg["persistence"]["state_file"])
 
+    # --- M4 wiring point: exchange-side STOP_LOSS ---
+    # execution/stop_order_manager.py is complete (M2) and BinanceClient already
+    # satisfies its StopOrderClient protocol, but M3 deliberately keeps the
+    # local stop only. When M4 lands, construct it here:
+    #     stop_om = StopOrderManager(client, cfg)
+    # and enable the three call sites marked "M4:" below, plus a startup
+    # stop_om.sync(sym) / ensure_stop() pass for restored positions.
+
     # --- Restore state ---
     state = state_mgr.load()
-    position = state.position
-    cooldowns: Dict[str, datetime] = {}
-    if position and position.cooldown_until:
-        cooldowns[position.symbol] = position.cooldown_until
+    positions: Dict[str, Position] = {pos.symbol: pos for pos in state.positions}
+    cooldowns: Dict[str, datetime] = dict(state.cooldowns)
+    for pos in positions.values():
+        # v1 state carried the cooldown on the position itself.
+        if pos.cooldown_until and pos.symbol not in cooldowns:
+            cooldowns[pos.symbol] = pos.cooldown_until
     cb.halt_until = state.halt_until
     cb.consecutive_api_errors = state.consecutive_api_errors
+    log.info(
+        f"Restored {len(positions)}/{max_concurrent} position(s): "
+        f"{', '.join(sorted(positions)) or 'flat'}"
+    )
 
-    # --- Reconcile position with exchange (起動時照合) ---
-    if position:
+    # --- Reconcile positions with exchange (起動時照合) ---
+    for sym in list(positions):
+        pos = positions[sym]
         try:
-            base = (
-                position.symbol[: -len(quote_asset)]
-                if position.symbol.endswith(quote_asset)
-                else position.symbol
-            )
+            base = _base_asset(sym, quote_asset)
             actual_qty = client.get_spot_balance(base)
-            if actual_qty < position.qty * 0.95:
+            if actual_qty < pos.qty * 0.95:
                 log.warning(
-                    f"Position drift: expected {position.qty} {base}, "
+                    f"Position drift: expected {pos.qty} {base} ({sym}), "
                     f"actual {actual_qty}. Resetting position."
                 )
                 notifier.notify_error(
-                    f"Position drift detected: {position.qty} → {actual_qty} {base}"
+                    f"Position drift detected: {pos.qty} → {actual_qty} {base} ({sym})"
                 )
-                position = None
+                del positions[sym]
         except Exception as e:
-            log.error(f"Balance reconciliation failed: {e}")
+            log.error(f"Balance reconciliation failed for {sym}: {e}")
 
     # --- Fetch lot sizes for each symbol ---
     lot_info: Dict[str, Dict[str, float]] = {}
-    for sym in cfg["exchange"]["symbols"]:
+    for sym in symbols:
         try:
             lot_info[sym] = client.get_lot_size(sym)
         except Exception as e:
             log.warning(f"Could not fetch lot_size for {sym}: {e}")
-            lot_info[sym] = {"minQty": 0.00001, "maxQty": 999999, "stepSize": 0.00001}
+            lot_info[sym] = {
+                "minQty": 0.00001,
+                "maxQty": 999999,
+                "stepSize": 0.00001,
+                "minNotional": 0.0,
+            }
 
     log.info("Entering main loop")
 
@@ -154,7 +180,7 @@ def main() -> None:
             feat_1h: Dict[str, Any] = {}
             feat_5m: Dict[str, Any] = {}
 
-            for sym in cfg["exchange"]["symbols"]:
+            for sym in symbols:
                 try:
                     # 1h: fetch last 250 bars (for indicator warmup)
                     df_1h = client.fetch_klines(sym, "1h", limit=250)
@@ -196,163 +222,200 @@ def main() -> None:
                         feat_1h[sym]["regime"] = Regime.RANGE
                         feat_1h[sym].iloc[-1, feat_1h[sym].columns.get_loc("regime")] = regime
 
-            # --- Position management ---
-            if position is not None:
-                sym = position.symbol
-                if sym in feat_1h and not feat_1h[sym].empty:
-                    row = feat_1h[sym].iloc[-1]
-                    current_close = client.get_ticker_price(sym)
-                    current_atr = row["atr"]
-                    current_atrp = float(row.get("atrp", 0.0))
-                    current_adx = float(row.get("adx", 0.0))
-                    trend_ma_val = float(row.get("trend_ma", 0.0))
-                    current_high = float(row.get("high", current_close))
-                    current_low = float(row.get("low", current_close))
-                    regime = classify_regime(row, cfg)
+            # --- Position management (one pass per open slot) ---
+            for sym in list(positions):
+                position = positions.get(sym)
+                if position is None:
+                    continue
+                df = feat_1h.get(sym)
+                if df is None or df.empty:
+                    continue
 
-                    # Update trail
-                    position = pm.update_stop(
-                        position,
-                        current_close,
-                        current_atr,
-                        now=now,
-                        current_atrp=current_atrp,
-                        current_high=current_high,
-                        current_low=current_low,
-                        current_adx=current_adx,
-                        trend_ma=trend_ma_val,
+                row = df.iloc[-1]
+                current_close = client.get_ticker_price(sym)
+                current_atr = row["atr"]
+                current_atrp = float(row.get("atrp", 0.0))
+                current_adx = float(row.get("adx", 0.0))
+                trend_ma_val = float(row.get("trend_ma", 0.0))
+                current_high = float(row.get("high", current_close))
+                current_low = float(row.get("low", current_close))
+                regime = classify_regime(row, cfg)
+
+                # Update trail
+                position = pm.update_stop(
+                    position,
+                    current_close,
+                    current_atr,
+                    now=now,
+                    current_atrp=current_atrp,
+                    current_high=current_high,
+                    current_low=current_low,
+                    current_adx=current_adx,
+                    trend_ma=trend_ma_val,
+                )
+                positions[sym] = position
+                # M4: stop_om.ensure_stop(position) / stop_om.update_stop(position, position.stop_price)
+
+                # --- Check partial TP (live) ---
+                if (
+                    not position.partial_taken
+                    and pm.check_partial_tp(
+                        position, current_close, current_adx=current_adx, trend_ma=trend_ma_val
+                    )
+                ):
+                    partial_ratio = float(cfg.get("partial_tp", {}).get("ratio", 0.5))
+                    partial_qty = position.initial_qty * partial_ratio
+
+                    # Round qty to lot step
+                    li = lot_info.get(sym, {})
+                    partial_qty = round_down_step(
+                        partial_qty, li.get("stepSize", 0.00001)
                     )
 
-                    # --- Check partial TP (live) ---
-                    if (
-                        not position.partial_taken
-                        and pm.check_partial_tp(
-                            position, current_close, current_adx=current_adx, trend_ma=trend_ma_val
-                        )
-                    ):
-                        partial_ratio = float(cfg.get("partial_tp", {}).get("ratio", 0.5))
-                        partial_qty = position.initial_qty * partial_ratio
-
-                        # Round qty to lot step
-                        li = lot_info.get(sym, {})
-                        partial_qty = round_down_step(
-                            partial_qty, li.get("stepSize", 0.00001)
-                        )
-
-                        if partial_qty > 0:
-                            partial_order = om.create_exit_order(sym, partial_qty, now)
-                            try:
-                                partial_order = broker.execute(partial_order)
-                                partial_price = partial_order.filled_price or current_close
-                                partial_pnl = partial_qty * (partial_price - position.entry_price)
-
-                                # Update position state
-                                position.qty -= partial_qty
-                                position.partial_taken = True
-                                position.runner_mode = True
-                                position.partial_price = partial_price
-                                position.partial_time = now
-                                position.entry_cost *= (
-                                    position.qty / (position.qty + partial_qty)
-                                )
-
-                                notifier.notify_partial_tp(
-                                    sym, partial_qty, partial_price, partial_pnl,
-                                    position.qty,
-                                )
-
-                            except Exception as e:
-                                log.error(f"Partial TP order failed: {e}")
-                                notifier.notify_error(f"Partial TP failed: {e}")
-
-                    # Check exit
-                    exit_reason = pm.check_exit(
-                        position, current_close, current_atr, regime, now,
-                        ema_slow=float(row.get("ema_slow", 0.0)),
-                        current_adx=current_adx,
-                        trend_ma=trend_ma_val,
-                    )
-                    if exit_reason is not None:
-                        # Execute sell
-                        exit_order = om.create_exit_order(sym, position.qty, now)
+                    if partial_qty > 0:
+                        partial_order = om.create_exit_order(sym, partial_qty, now)
                         try:
-                            exit_order = broker.execute(exit_order)
-                            exit_price = exit_order.filled_price or current_close
-                            pnl = position.qty * (exit_price - position.entry_price)
+                            partial_order = broker.execute(partial_order)
+                            partial_price = partial_order.filled_price or current_close
+                            partial_pnl = partial_qty * (partial_price - position.entry_price)
 
-                            notifier.notify_exit(
-                                sym, position.qty, exit_price, exit_reason.value, pnl
-                            )
-                            cooldown_hours = _get_cooldown_hours(exit_reason, cfg)
-                            cooldowns[sym] = pm.compute_cooldown(now, cooldown_hours)
-
-                            # Equity snapshot
-                            quote_balance = client.get_account_balance(quote_asset)
-                            state.equity_snapshots.append(
-                                {"ts": now.isoformat(), "equity": quote_balance}
+                            # Update position state
+                            position.qty -= partial_qty
+                            position.partial_taken = True
+                            position.runner_mode = True
+                            position.partial_price = partial_price
+                            position.partial_time = now
+                            position.entry_cost *= (
+                                position.qty / (position.qty + partial_qty)
                             )
 
-                            # Circuit breaker check
-                            cb.check_equity(state.equity_snapshots, now)
-                            if cb.halt_until:
-                                notifier.notify_halt(
-                                    f"Loss limit breached", cb.halt_until
-                                )
-
-                            position = None
+                            notifier.notify_partial_tp(
+                                sym, partial_qty, partial_price, partial_pnl,
+                                position.qty,
+                            )
+                            # M4: stop_om.update_stop(position, position.stop_price) after resize
 
                         except Exception as e:
-                            log.error(f"Exit order failed: {e}")
-                            notifier.notify_error(f"Exit failed: {e}")
+                            log.error(f"Partial TP order failed for {sym}: {e}")
+                            notifier.notify_error(f"Partial TP failed: {e}")
 
-            # --- Signal generation (only at 1h boundaries or every loop for simplicity) ---
-            if position is None and _is_1h_boundary(now):
+                # Check exit
+                exit_reason = pm.check_exit(
+                    position, current_close, current_atr, regime, now,
+                    ema_slow=float(row.get("ema_slow", 0.0)),
+                    current_adx=current_adx,
+                    trend_ma=trend_ma_val,
+                )
+                if exit_reason is None:
+                    continue
+
+                # Execute sell
+                exit_order = om.create_exit_order(sym, position.qty, now)
+                try:
+                    exit_order = broker.execute(exit_order)
+                except Exception as e:
+                    log.error(f"Exit order failed for {sym}: {e}")
+                    notifier.notify_error(f"Exit failed: {e}")
+                    continue
+
+                exit_price = exit_order.filled_price or current_close
+                pnl = position.qty * (exit_price - position.entry_price)
+
+                notifier.notify_exit(
+                    sym, position.qty, exit_price, exit_reason.value, pnl
+                )
+                # M4: stop_om.cancel(sym) — the exchange stop must go with the position.
+                cooldown_hours = _get_cooldown_hours(exit_reason, cfg)
+                cooldowns[sym] = pm.compute_cooldown(now, cooldown_hours)
+                # Drop the slot as soon as the sell is filled so a failure in the
+                # bookkeeping below can never trigger a second sell of the same qty.
+                del positions[sym]
+
+                # Equity snapshot + circuit breaker (best effort, post-fill)
+                try:
+                    quote_balance = client.get_account_balance(quote_asset)
+                    state.equity_snapshots.append(
+                        {"ts": now.isoformat(), "equity": quote_balance}
+                    )
+                    cb.check_equity(state.equity_snapshots, now)
+                    if cb.halt_until:
+                        notifier.notify_halt("Loss limit breached", cb.halt_until)
+                except Exception as e:
+                    log.error(f"Equity snapshot failed after exit {sym}: {e}")
+
+            # --- Entry (only at 1h boundaries, and only while slots are free) ---
+            free_slots = max_concurrent - len(positions)
+            if free_slots > 0 and _is_1h_boundary(now):
                 signals = generate_signals(
                     feat_1h, feat_5m, cfg, now,
-                    current_position=position,
+                    current_positions=list(positions.values()),
                     cooldowns=cooldowns,
                 )
+                equity = 0.0
                 if signals:
-                    best = signals[0]
-                    li = lot_info.get(best.symbol, {})
-                    equity = client.get_account_balance(quote_asset)
+                    try:
+                        equity = client.get_account_balance(quote_asset)
+                    except Exception as e:
+                        log.error(f"Balance fetch failed – skipping entries: {e}")
+                        notifier.notify_error(f"Balance fetch failed: {e}")
 
+                for best in signals:
+                    # generate_signals already caps at the free slots; this is a
+                    # belt-and-braces guard against same-loop races.
+                    if len(positions) >= max_concurrent:
+                        break
+                    if best.symbol in positions:
+                        log.debug(f"{best.symbol} already held – skipping duplicate entry")
+                        continue
+                    if equity <= 0:
+                        break
+
+                    li = lot_info.get(best.symbol, {})
                     qty = compute_qty(
                         best, equity, cfg,
                         lot_step=li.get("stepSize", 0.00001),
                         min_qty=li.get("minQty", 0.00001),
+                        min_notional=li.get("minNotional", 0.0),
                     )
-                    if qty > 0:
-                        entry_order = om.create_entry_order(best, qty, now)
-                        try:
-                            entry_order = broker.execute(entry_order)
-                            filled_price = entry_order.filled_price or best.entry_price
+                    if qty <= 0:
+                        continue
 
-                            position = Position(
-                                symbol=best.symbol,
-                                qty=qty,
-                                entry_price=filled_price,
-                                stop_price=best.stop_price,
-                                initial_stop_price=0.0,
-                                entry_ts=now,
-                                highest_price=filled_price,
-                                lowest_price=filled_price,
-                                atr_at_entry=feat_1h[best.symbol].iloc[-1]["atr"],
-                                initial_qty=qty,
-                                bars_since_entry=0,
-                            )
-                            pm.apply_initial_stop(position, position.atr_at_entry)
-                            notifier.notify_entry(
-                                best.symbol, qty, filled_price, position.stop_price
-                            )
-                            cb.reset_api_errors()
+                    entry_order = om.create_entry_order(best, qty, now)
+                    try:
+                        entry_order = broker.execute(entry_order)
+                        filled_price = entry_order.filled_price or best.entry_price
+                        atr_at_entry = float(feat_1h[best.symbol].iloc[-1]["atr"])
 
-                        except Exception as e:
-                            log.error(f"Entry order failed: {e}")
-                            notifier.notify_error(f"Entry failed: {e}")
+                        position = Position(
+                            symbol=best.symbol,
+                            qty=qty,
+                            entry_price=filled_price,
+                            stop_price=best.stop_price,
+                            initial_stop_price=0.0,
+                            entry_ts=now,
+                            highest_price=filled_price,
+                            lowest_price=filled_price,
+                            atr_at_entry=atr_at_entry,
+                            initial_qty=qty,
+                            bars_since_entry=0,
+                        )
+                        # Record the slot before any post-fill bookkeeping so a
+                        # failure here cannot lead to a duplicate buy next loop.
+                        positions[best.symbol] = position
+                        pm.apply_initial_stop(position, position.atr_at_entry)
+                        # M4: stop_om.place_initial_stop(position) — exchange-side protection.
+                        notifier.notify_entry(
+                            best.symbol, qty, filled_price, position.stop_price
+                        )
+                        cb.reset_api_errors()
+
+                    except Exception as e:
+                        log.error(f"Entry order failed for {best.symbol}: {e}")
+                        notifier.notify_error(f"Entry failed ({best.symbol}): {e}")
 
             # --- Persist state ---
-            state.position = position
+            state.positions = list(positions.values())
+            state.cooldowns = dict(cooldowns)
             state.last_process_ts = now
             state.halt_until = cb.halt_until
             state.consecutive_api_errors = cb.consecutive_api_errors
@@ -360,7 +423,8 @@ def main() -> None:
 
         except KeyboardInterrupt:
             log.info("Shutting down (KeyboardInterrupt)")
-            state.position = position
+            state.positions = list(positions.values())
+            state.cooldowns = dict(cooldowns)
             state.last_process_ts = clock.now()
             state_mgr.save(state)
             break

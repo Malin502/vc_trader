@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Iterable, List, Optional
 
 
 # ============================================================
@@ -193,10 +193,60 @@ class TradeRecord:
 
 @dataclass
 class SystemState:
-    """Persistent state for restart recovery."""
-    position: Optional[Position] = None
-    last_signal_ts: Optional[datetime] = None
-    last_process_ts: Optional[datetime] = None
-    equity_snapshots: list = field(default_factory=list)
-    halt_until: Optional[datetime] = None
-    consecutive_api_errors: int = 0
+    """Persistent state for restart recovery.
+
+    M3: the bot may hold up to ``position.max_concurrent`` positions at once,
+    so positions live in an ordered list and per-symbol cooldowns live in a
+    dict.  ``position`` is kept as a **read-only** compatibility view of the
+    first slot for callers written against the single-position era.
+    """
+
+    def __init__(
+        self,
+        positions: Optional[Iterable["Position"]] = None,
+        cooldowns: Optional[Dict[str, datetime]] = None,
+        position: Optional["Position"] = None,
+        last_signal_ts: Optional[datetime] = None,
+        last_process_ts: Optional[datetime] = None,
+        equity_snapshots: Optional[list] = None,
+        halt_until: Optional[datetime] = None,
+        consecutive_api_errors: int = 0,
+    ) -> None:
+        self.positions: List[Position] = list(positions or [])
+        self.cooldowns: Dict[str, datetime] = dict(cooldowns or {})
+        if position is not None:
+            self.add_position(position)
+        self.last_signal_ts = last_signal_ts
+        self.last_process_ts = last_process_ts
+        self.equity_snapshots: list = list(equity_snapshots or [])
+        self.halt_until = halt_until
+        self.consecutive_api_errors = consecutive_api_errors
+
+    # -- legacy single-position view -----------------------------------
+    @property
+    def position(self) -> Optional["Position"]:
+        """First open position (legacy accessor; read-only)."""
+        return self.positions[0] if self.positions else None
+
+    # -- multi-position helpers ----------------------------------------
+    def get_position(self, symbol: str) -> Optional["Position"]:
+        for pos in self.positions:
+            if pos.symbol == symbol:
+                return pos
+        return None
+
+    def add_position(self, position: "Position") -> None:
+        """Append *position*; a symbol may only be held in one slot."""
+        if self.get_position(position.symbol) is not None:
+            raise ValueError(f"position already open for {position.symbol}")
+        self.positions.append(position)
+
+    def remove_position(self, symbol: str) -> Optional["Position"]:
+        for idx, pos in enumerate(self.positions):
+            if pos.symbol == symbol:
+                return self.positions.pop(idx)
+        return None
+
+    @property
+    def held_symbols(self) -> List[str]:
+        return [pos.symbol for pos in self.positions]

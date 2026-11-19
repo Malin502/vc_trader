@@ -17,7 +17,7 @@ def _minimal_cfg(**overrides):
         "exchange": {
             "name": "binance",
             "env": "prod",
-            "base_url": "https://api.binance.co.jp",
+            "base_url": "https://api.binance.com",
             "testnet_base_url": "https://testnet.binance.vision",
             "quote_asset": "JPY",
             "symbols": ["BTCJPY", "ETHJPY"],
@@ -51,7 +51,7 @@ def _write_cfg(tmp_path, cfg):
 class TestResolveBaseUrl:
     def test_prod_uses_base_url(self):
         cfg = _minimal_cfg()
-        assert resolve_base_url(cfg) == "https://api.binance.co.jp"
+        assert resolve_base_url(cfg) == "https://api.binance.com"
 
     def test_testnet_uses_testnet_base_url(self):
         cfg = _minimal_cfg(exchange={"env": "testnet"})
@@ -106,9 +106,9 @@ class TestLoadConfig:
         cfg = load_config()
         assert cfg["sizing"]["risk_per_trade"] == 0.02
         assert cfg["exchange"]["env"] == "prod"
-        # prod host is deliberately unset until Binance Japan is confirmed
-        assert cfg["exchange"]["base_url"] == ""
-        assert resolve_base_url(_minimal_cfg())  # explicit config still resolvable
+        # Binance Japan runs on the global platform: api.binance.com is the host.
+        assert cfg["exchange"]["base_url"] == "https://api.binance.com"
+        assert resolve_base_url(cfg) == "https://api.binance.com"
 
     def test_risk_mode_env_override(self, tmp_path, monkeypatch):
         path = _write_cfg(tmp_path, _minimal_cfg())

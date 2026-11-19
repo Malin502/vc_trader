@@ -16,13 +16,13 @@
 - 複雑な深層学習（Phase B/Cで導入）
 
 ## 2. 取引仕様
-- 取引所: Binance Spot
-- シンボル: BTCUSDC, ETHUSDC
+- 取引所: Binance Spot（`exchange.env` = prod / testnet、loader が base_url を解決）
+- シンボル: BTCJPY, ETHJPY, XRPJPY, SOLJPY（config の `exchange.symbols`）
 - シグナル生成: 1h足
 - 執行フィルタ: 5m足
 - 監視: 5m足（推奨）
-- 最大1ポジション（BTC or ETHのみ）
-- クールダウン: 決済後6時間再エントリ禁止
+- 最大2ポジション（`position.max_concurrent` = 2、同一銘柄1枠まで）
+- クールダウン: 決済後24時間再エントリ禁止（STOP_LOSS は48h）
 - コスト: 往復0.30%（手数料+スリッページ）
 
 ## 3. 戦略概要
@@ -45,7 +45,7 @@
 - Pullback: |close-ema_fast|/close<=0.3%
 - Breakout: close>donchian_high_prev, volume>SMA(volume,20)
 - 5mフィルタ: EMA20>EMA50, micro_vol<=90%点
-- 追加: ポジション/クールダウン中は不可
+- 追加: 同一銘柄の保有中・クールダウン中は不可（別銘柄は空き枠があれば可）
 
 ## 7. エグジット条件
 - 初期ストップ: entry-ATR*2.2, recent_swing_low-ATR*0.3 の高い方
@@ -54,9 +54,9 @@
 - レジームCHAOS化: 即時決済
 
 ## 8. ポジションサイズ
-- 損失上限: 口座資産の5%
-- サイズ: risk/stop_dist, lot丸め, 最大投下資金=95%
-- BTC/ETH同時シグナル時はスコアで選択
+- 損失上限: 1トレードあたり口座資産の2%（paper）/ 1%（live）— `sizing.risk_mode`
+- サイズ: risk/stop_dist, lot丸め, 1枠あたり投下資金 <= 50%（`sizing.max_notional_pct`）
+- 同時シグナル時はスコア上位から空き枠（最大2）に割当、同一銘柄は二重エントリしない
 
 ## 9. システム構成
 - ディレクトリ: aivc_trade/以下にconfig,core,data,strategy,execution,backtest,ops,main
@@ -76,7 +76,7 @@
 
 ## 12. 例外・安全設計
 - サーキットブレーカ: 24h-15%, 7d-25%で停止
-- 状態永続化: position_state.json
+- 状態永続化: position_state.json（複数ポジション + 銘柄別クールダウン、旧v1形式は読み込み時に自動移行）
 - 通知: Discord Webhook
 
 ## 13. AWS配置
