@@ -30,8 +30,18 @@ NOW = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
 # ----------------------------------------------------------------------
 
 def _cfg() -> dict:
-    """Fresh default config dict (no shared state between tests)."""
-    return json.loads(json.dumps(load_config()))
+    """Fresh config dict for the M3 *two-slot mechanism* tests.
+
+    MS6 で運用既定は「1枠 / BTC・ETH・XRP（SOL は観測のみ）」に変わった。
+    このファイルは 2 枠機構そのもの（複数保有・同一銘柄ガード・スコア順）の
+    検証なので、機構が有効な設定を明示的に組む。新しい既定値そのものは
+    tests/test_ms6_reconfigure.py で検証する。
+    """
+    cfg = json.loads(json.dumps(load_config()))
+    cfg["position"]["max_concurrent"] = 2
+    cfg["exchange"]["symbols"] = ["BTCJPY", "ETHJPY", "XRPJPY", "SOLJPY"]
+    cfg["exchange"]["shadow_symbols"] = []
+    return cfg
 
 
 def _position(symbol: str, **overrides) -> Position:
@@ -366,7 +376,8 @@ class TestSlotSizing:
     def test_zero_equity_returns_zero(self):
         assert compute_qty(self._signal(), 0.0, _cfg()) == 0.0
 
-    def test_risk_per_trade_paper_beats_live(self):
+    def test_risk_per_trade_paper_equals_live(self):
+        """MS6: ペーパーとライブのリスクは同一値（1%）に統一された。"""
         cfg = _cfg()
         cfg["sizing"]["max_notional_pct"] = 1.0  # isolate the risk cap
         sig = self._signal(stop=4_800_000.0)     # 4% stop → risk cap binding
@@ -381,8 +392,21 @@ class TestSlotSizing:
         cfg["sizing"].pop("risk_per_trade", None)
         qty_live = compute_qty(sig, 1_000_000.0, cfg, lot_step=1e-6)
 
-        assert qty_paper > qty_live > 0
-        assert qty_paper / qty_live == pytest.approx(2.0, rel=1e-3)
+        assert qty_paper > 0
+        assert qty_paper == pytest.approx(qty_live, rel=1e-9)
+
+    def test_explicit_risk_profile_still_scales_size(self):
+        """明示 risk_per_trade は従来どおり数量に比例する（1% と 2% で 2 倍）。"""
+        cfg = _cfg()
+        cfg["sizing"]["max_notional_pct"] = 1.0
+        sig = self._signal(stop=4_800_000.0)
+
+        cfg["sizing"]["risk_per_trade"] = 0.01
+        qty_1 = compute_qty(sig, 1_000_000.0, cfg, lot_step=1e-6)
+        cfg["sizing"]["risk_per_trade"] = 0.02
+        qty_2 = compute_qty(sig, 1_000_000.0, cfg, lot_step=1e-6)
+
+        assert qty_2 / qty_1 == pytest.approx(2.0, rel=1e-3)
 
 
 # ----------------------------------------------------------------------
@@ -469,6 +493,14 @@ class TestMainLivePortfolioLoop:
                     "stepSize": 1e-05, "minNotional": 0.0,
                 }
 
+            def fetch_order_book(self, symbol, limit=100):
+                price = prices[symbol]
+                return {
+                    "lastUpdateId": 1,
+                    "bids": [[str(price * 0.9999), "1.0"], [str(price * 0.995), "5.0"]],
+                    "asks": [[str(price * 1.0001), "1.0"], [str(price * 1.005), "5.0"]],
+                }
+
             def place_market_order(self, symbol, side, qty):
                 return {
                     "orderId": "1",
@@ -551,8 +583,11 @@ class TestMainLivePortfolioLoop:
 
         cfg = _cfg()
         cfg["exchange"]["symbols"] = ["BTCJPY", "ETHJPY"]
+        cfg["exchange"]["shadow_symbols"] = []
+        cfg["position"]["max_concurrent"] = 2
         cfg["persistence"]["state_file"] = str(tmp_path / "state.json")
         cfg["persistence"]["candles_dir"] = str(tmp_path / "candles")
+        cfg["persistence"]["signal_journal_path"] = str(tmp_path / "signals.jsonl")
         cfg["notification"]["discord_webhook_url"] = ""
         monkeypatch.delenv("DISCORD_WEBHOOK_URL", raising=False)
         monkeypatch.setattr(main_live, "load_config", lambda: cfg)

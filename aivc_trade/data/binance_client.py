@@ -301,6 +301,20 @@ class BinanceClient:
         return float(data["price"])
 
     # ------------------------------------------------------------------
+    # Public: Order book depth
+    # ------------------------------------------------------------------
+    def fetch_order_book(self, symbol: str, limit: int = 100) -> Dict[str, Any]:
+        """Fetch the public depth snapshot (``/api/v3/depth``).
+
+        MS6 Step 3: the raw payload is returned as-is; parsing / band
+        aggregation lives in :mod:`aivc_trade.data.orderbook` so it can be
+        unit-tested without HTTP.
+        """
+        return self._public_get(
+            "/api/v3/depth", {"symbol": symbol, "limit": int(limit)}
+        )
+
+    # ------------------------------------------------------------------
     # Quantity / price formatting
     # ------------------------------------------------------------------
     def format_quantity(self, symbol: str, qty: float) -> str:

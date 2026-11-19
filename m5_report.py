@@ -28,10 +28,17 @@ from aivc_trade.config.loader import load_config, resolve_risk_per_trade
 from aivc_trade.core.logger import get_logger, setup_logger
 from aivc_trade.data.candles_store import CandlesStore
 from aivc_trade.backtest.simulator import Simulator
-from aivc_trade.backtest.metrics import compute_metrics
+from aivc_trade.backtest.metrics import (
+    compute_metrics,
+    breakeven_slippage_bps,
+    position_cost_rows,
+)
 from aivc_trade.core.types import TradeRecord
 
 log = get_logger("m5_report")
+
+#: M5 報告時点の paper リスク（当時の config 既定）。再現性のため固定する。
+M5_PAPER_RISK = 0.02
 
 PERIOD_START = datetime(2024, 5, 1, tzinfo=timezone.utc)
 DESIGN_IS_END = datetime(2026, 1, 1, tzinfo=timezone.utc)  # 設計時に使った期間の終わり
@@ -95,6 +102,11 @@ def build_config(
     cfg["sizing"]["risk_mode"] = risk_mode
     cfg["sizing"].pop("risk_per_trade", None)
     cfg["sizing"]["risk_per_trade"] = resolve_risk_per_trade(cfg["sizing"])
+    if risk_mode == "paper":
+        # MS6 で config の paper 既定は 1% になった。このスクリプトは M5 報告
+        # （doc/m5_phase1_report.md）の再現用なので、当時の比較条件「paper 2%」を
+        # 明示的に固定する。再構成後の数値は ms6_report.py が担当。
+        cfg["sizing"]["risk_per_trade"] = M5_PAPER_RISK
     if slippage_by_symbol is not None:
         cfg["costs"]["slippage_bps_by_symbol"] = dict(slippage_by_symbol)
     cfg["position"]["max_concurrent"] = 2
@@ -160,6 +172,7 @@ def slice_report(
     start: datetime,
     end: datetime,
     initial_equity: float,
+    commission_bps: float = 10.0,
 ) -> Dict[str, Any]:
     tr_ts = [t for t in trades if start <= t.entry_ts <= end]
     e = eq[(eq["ts"] >= start) & (eq["ts"] <= end)].reset_index(drop=True) if not eq.empty else pd.DataFrame()
@@ -168,6 +181,9 @@ def slice_report(
     pos = positions_from_trades(tr_ts)
     pos = pos[(pos["entry_ts"] >= start) & (pos["entry_ts"] <= end)] if not pos.empty else pos
     pnls = pos["net_pnl"].tolist() if not pos.empty else []
+    # MS6 Step4: PF が 1 になる片道スリッページ水準（bps）を標準指標として併記
+    cost_rows = position_cost_rows(tr_ts)
+    be_bps = breakeven_slippage_bps(cost_rows, commission_bps=commission_bps)
     return {
         "start": start.date().isoformat(),
         "end": end.date().isoformat(),
@@ -184,6 +200,7 @@ def slice_report(
         "total_cost": float(pos["cost"].sum()) if not pos.empty else 0.0,
         "net_pnl": float(pos["net_pnl"].sum()) if not pos.empty else 0.0,
         "expectancy_per_position": float(np.mean(pnls)) if pnls else 0.0,
+        "breakeven_slippage_bps": be_bps,
         "exit_reasons": m["exit_reasons"],
         "equity": e,
         "positions": pos,
@@ -235,6 +252,7 @@ def main() -> None:
     candles = load_candles(SYMBOLS)
     lot_info = json.loads(Path("data/lot_info.json").read_text())
     initial_equity = float(base["backtest"]["initial_equity"])
+    commission_bps = float(base["costs"]["commission_bps"])
 
     data_start = min(df["ts"].min() for df in candles.values())
     data_end = max(df["ts"].max() for df in candles.values())
@@ -257,6 +275,7 @@ def main() -> None:
             "commission_bps": base["costs"]["commission_bps"],
             "slippage_bps": base["costs"]["slippage_bps"],
             "risk_per_trade_paper": base["sizing"]["risk_per_trade_paper"],
+            "risk_per_trade_paper_used": M5_PAPER_RISK,
             "risk_per_trade_live": base["sizing"]["risk_per_trade_live"],
             "max_notional_pct": base["sizing"]["max_notional_pct"],
         },
@@ -271,7 +290,7 @@ def main() -> None:
                 slippage_by_symbol=slip, lot_info=lot_info,
             )
             trades, eq = run_one(cfg, candles, PERIOD_START)
-            rep = slice_report(trades, eq, PERIOD_START, data_end, initial_equity)
+            rep = slice_report(trades, eq, PERIOD_START, data_end, initial_equity, commission_bps=commission_bps)
             key = f"{risk_mode}:{scen_name}"
             rep.pop("equity", None)
             rep.pop("positions", None)
@@ -292,7 +311,7 @@ def main() -> None:
         )
         trades, eq = run_one(cfg, candles, PERIOD_START)
 
-        full = slice_report(trades, eq, PERIOD_START, data_end, initial_equity)
+        full = slice_report(trades, eq, PERIOD_START, data_end, initial_equity, commission_bps=commission_bps)
         pos = full["positions"]
         pos.to_csv(OUT_DIR / f"positions_paper_{scen}.csv", index=False)
         eq.to_csv(OUT_DIR / f"equity_paper_{scen}.csv", index=False)
@@ -314,22 +333,22 @@ def main() -> None:
         cursor = PERIOD_START
         while cursor < data_end:
             nxt = min(cursor + timedelta(days=182), data_end)
-            f = slice_report(trades, eq, cursor, nxt, initial_equity)
+            f = slice_report(trades, eq, cursor, nxt, initial_equity, commission_bps=commission_bps)
             f.pop("equity", None)
             f.pop("positions", None)
             folds.append(f)
             cursor = nxt
 
-        is_rep = slice_report(trades, eq, PERIOD_START, DESIGN_IS_END, initial_equity)
+        is_rep = slice_report(trades, eq, PERIOD_START, DESIGN_IS_END, initial_equity, commission_bps=commission_bps)
         is_rep.pop("equity", None)
         is_rep.pop("positions", None)
-        oos_rep = slice_report(trades, eq, DESIGN_IS_END, data_end, initial_equity)
+        oos_rep = slice_report(trades, eq, DESIGN_IS_END, data_end, initial_equity, commission_bps=commission_bps)
         oos_rep.pop("equity", None)
         oos_rep.pop("positions", None)
 
         # 連結 OOS = 連続実行した 1 本の equity をそのまま使う（フォールド境界で
         # 資金を切り直さない）。フォールド別は安定性の確認用。
-        concat = slice_report(trades, eq, PERIOD_START, data_end, initial_equity)
+        concat = slice_report(trades, eq, PERIOD_START, data_end, initial_equity, commission_bps=commission_bps)
         concat.pop("equity", None)
         concat.pop("positions", None)
 

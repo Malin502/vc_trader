@@ -329,7 +329,7 @@ class TestRegimeHysteresis:
 
 class TestSizing:
     def test_risk_per_trade_cap(self, sample_config):
-        """Risk per trade must stay within the configured paper-mode 2%."""
+        """Risk per trade must stay within the configured paper-mode 1%."""
         from aivc_trade.strategy.sizing import compute_qty
         from aivc_trade.core.types import Signal, Side
         sig = Signal(
@@ -342,8 +342,8 @@ class TestSizing:
         equity = 10000.0
         qty = compute_qty(sig, equity, sample_config, lot_step=0.00001, min_qty=0.00001)
         max_loss = qty * (sig.entry_price - sig.stop_price)
-        assert sample_config["sizing"]["risk_per_trade"] == 0.02
-        assert max_loss <= equity * 0.02 + 0.01
+        assert sample_config["sizing"]["risk_per_trade"] == 0.01
+        assert max_loss <= equity * 0.01 + 0.01
 
     def test_max_notional_cap(self, sample_config):
         from aivc_trade.strategy.sizing import compute_qty
@@ -1178,11 +1178,15 @@ class TestConfig:
         cfg = load_config()
         assert "exchange" in cfg
         assert "BTCJPY" in cfg["exchange"]["symbols"]
-        assert cfg["exchange"]["symbols"] == ["BTCJPY", "ETHJPY", "XRPJPY", "SOLJPY"]
+        # MS6: 運用対象は 3 ペア（SOL は観測のみ）
+        assert cfg["exchange"]["symbols"] == ["BTCJPY", "ETHJPY", "XRPJPY"]
+        assert cfg["exchange"]["shadow_symbols"] == ["SOLJPY"]
+        assert cfg["position"]["max_concurrent"] == 1
         assert cfg["exchange"]["env"] == "prod"
         assert cfg["exchange"]["quote_asset"] == "JPY"
         assert cfg["sizing"]["risk_mode"] == "paper"
-        assert cfg["sizing"]["risk_per_trade"] == 0.02
+        # MS6: ペーパーもライブも 1%
+        assert cfg["sizing"]["risk_per_trade"] == 0.01
         assert cfg["costs"]["roundtrip_cost_bps"] == 30
 
     def test_new_config_keys(self):

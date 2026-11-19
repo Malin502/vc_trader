@@ -104,7 +104,7 @@ class TestRiskMode:
 class TestLoadConfig:
     def test_default_config_injects_effective_risk(self):
         cfg = load_config()
-        assert cfg["sizing"]["risk_per_trade"] == 0.02
+        assert cfg["sizing"]["risk_per_trade"] == 0.01
         assert cfg["exchange"]["env"] == "prod"
         # Binance Japan runs on the global platform: api.binance.com is the host.
         assert cfg["exchange"]["base_url"] == "https://api.binance.com"

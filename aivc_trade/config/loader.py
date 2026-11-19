@@ -95,6 +95,33 @@ def resolve_risk_per_trade(sizing_cfg: Dict[str, Any]) -> float:
     return float(sizing_cfg[key])
 
 
+_SYMBOL_SECTION_HELP = "exchange.symbols (運用対象) / exchange.shadow_symbols (観測のみ)"
+
+
+def operational_symbols(cfg: Dict[str, Any]) -> list:
+    """Return the symbols the bot is allowed to trade (``exchange.symbols``)."""
+    return [str(s) for s in (cfg.get("exchange", {}).get("symbols") or [])]
+
+
+def shadow_symbols(cfg: Dict[str, Any]) -> list:
+    """Return symbols watched but never traded (``exchange.shadow_symbols``).
+
+    MS6 Step 2: SOLJPY lives here. Data fetch / feature computation / signal
+    evaluation continue for these symbols, but entries are recorded as shadow
+    trades instead of being sent to the exchange.
+    """
+    return [str(s) for s in (cfg.get("exchange", {}).get("shadow_symbols") or [])]
+
+
+def watched_symbols(cfg: Dict[str, Any]) -> list:
+    """Operational + shadow symbols (order preserved, no duplicates)."""
+    out: list = []
+    for sym in operational_symbols(cfg) + shadow_symbols(cfg):
+        if sym not in out:
+            out.append(sym)
+    return out
+
+
 def resolve_base_url(cfg: Dict[str, Any]) -> str:
     """Return the API base URL for the configured ``exchange.env``.
 
@@ -133,6 +160,9 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     _validate_exchange(cfg)
     _validate_sizing(cfg)
     _validate_stop_order(cfg)
+    _validate_drawdown(cfg)
+    _validate_shadow(cfg)
+    _validate_orderbook(cfg)
 
     risk_cfg = cfg.get("risk", {})
     initial_sl = risk_cfg.get("initial_sl", {})
@@ -216,6 +246,23 @@ def _validate_exchange(cfg: Dict[str, Any]) -> None:
             if not str(symbol).upper().endswith(quote_asset):
                 raise ValueError(
                     f"Invalid config: symbol {symbol!r} is not quoted in {quote_asset}"
+                )
+
+    # MS6: 観測専用シンボル（運用対象外）。運用対象と重複してはいけない。
+    shadow = exchange.get("shadow_symbols") or []
+    if len(set(shadow)) != len(shadow):
+        raise ValueError("Invalid config: exchange.shadow_symbols contains duplicates")
+    overlap = sorted(set(shadow) & set(symbols))
+    if overlap:
+        raise ValueError(
+            f"Invalid config: {','.join(overlap)} appears in both exchange.symbols "
+            f"and exchange.shadow_symbols ({_SYMBOL_SECTION_HELP})"
+        )
+    if quote_asset:
+        for symbol in shadow:
+            if not str(symbol).upper().endswith(quote_asset):
+                raise ValueError(
+                    f"Invalid config: shadow symbol {symbol!r} is not quoted in {quote_asset}"
                 )
 
     for key in ("base_url", "testnet_base_url"):
@@ -302,3 +349,75 @@ def _validate_stop_order(cfg: Dict[str, Any]) -> None:
         raise ValueError(
             "Invalid config: stop_order.safety_buffer_pct must satisfy 0 <= x < 100"
         )
+
+
+def _validate_drawdown(cfg: Dict[str, Any]) -> None:
+    """MaxDD 運用線（仕様 v2: 安全線 20% / 停止レビュー線 15%）の妥当性."""
+    dd = (cfg.get("risk", {}) or {}).get("max_drawdown") or {}
+    if not dd:
+        return
+
+    review = float(dd.get("review_line_pct", 0.15))
+    safe = float(dd.get("safe_line_pct", 0.20))
+    for name, value in (("review_line_pct", review), ("safe_line_pct", safe)):
+        if not (0.0 < value < 1.0):
+            raise ValueError(
+                f"Invalid config: risk.max_drawdown.{name} must satisfy 0 < x < 1.0, "
+                f"got {value}"
+            )
+    if review > safe:
+        raise ValueError(
+            "Invalid config: risk.max_drawdown.review_line_pct must be <= safe_line_pct"
+        )
+
+
+def _validate_shadow(cfg: Dict[str, Any]) -> None:
+    """シャドー観測（MS6 Step2）の設定値."""
+    shadow = cfg.get("shadow") or {}
+    if not shadow:
+        return
+
+    min_trades = int(shadow.get("min_trades", 20))
+    if min_trades < 1:
+        raise ValueError("Invalid config: shadow.min_trades must be >= 1")
+
+    for key in ("slippage_bps", "commission_bps"):
+        value = float(shadow.get(key, 0.0))
+        if value < 0:
+            raise ValueError(f"Invalid config: shadow.{key} must be >= 0")
+
+    equity = float(shadow.get("initial_equity", 0.0))
+    if equity <= 0:
+        raise ValueError("Invalid config: shadow.initial_equity must be > 0")
+
+    cooldown = int(shadow.get("cooldown_bars", 0))
+    if cooldown < 0:
+        raise ValueError("Invalid config: shadow.cooldown_bars must be >= 0")
+
+
+def _validate_orderbook(cfg: Dict[str, Any]) -> None:
+    """シグナル時点の板スナップショット（MS6 Step3）の設定値."""
+    ob = cfg.get("orderbook") or {}
+    if not ob:
+        return
+
+    limit = int(ob.get("depth_limit", 100))
+    if limit < 1:
+        raise ValueError("Invalid config: orderbook.depth_limit must be >= 1")
+    if limit > 5000:
+        raise ValueError("Invalid config: orderbook.depth_limit must be <= 5000")
+
+    bands = ob.get("bands_pct", [0.5, 1.0]) or []
+    if not bands:
+        raise ValueError("Invalid config: orderbook.bands_pct must not be empty")
+    for band in bands:
+        value = float(band)
+        if not (0.0 < value < 100.0):
+            raise ValueError(
+                f"Invalid config: orderbook.bands_pct entries must satisfy 0 < x < 100, "
+                f"got {band}"
+            )
+
+    timeout = float(ob.get("timeout_s", 5.0))
+    if timeout <= 0:
+        raise ValueError("Invalid config: orderbook.timeout_s must be > 0")

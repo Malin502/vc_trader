@@ -20,13 +20,19 @@ if __package__ in (None, ""):
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aivc_trade.config.loader import load_config, resolve_base_url
+from aivc_trade.config.loader import (
+    load_config,
+    resolve_base_url,
+    shadow_symbols,
+    watched_symbols,
+)
 from aivc_trade.core.clock import clock
 from aivc_trade.core.logger import get_logger, setup_logger
 from aivc_trade.core.types import ExitReason, Position, Regime, Side, SystemState
 from aivc_trade.data.binance_client import BinanceClient
 from aivc_trade.data.candles_store import CandlesStore
 from aivc_trade.data.feature_engine import compute_features_1h, compute_features_5m
+from aivc_trade.data.orderbook import OrderBookRecorder
 from aivc_trade.strategy.regime import classify_regime
 from aivc_trade.strategy.signal import generate_signals
 from aivc_trade.strategy.sizing import compute_qty, round_down_step
@@ -38,6 +44,8 @@ from aivc_trade.execution.broker import LiveBroker
 from aivc_trade.ops.healthcheck import HealthCheck
 from aivc_trade.ops.notifier import DiscordNotifier
 from aivc_trade.ops.persistence import StateManager
+from aivc_trade.ops.shadow import ShadowObserver
+from aivc_trade.ops.signal_journal import SignalJournal
 
 log = get_logger("main_live")
 
@@ -113,7 +121,11 @@ def main() -> None:
     # Quote asset is config-driven so the symbol set can change (JPY pairs) without
     # touching the loop. Default keeps the historical USDC behaviour.
     quote_asset = str(cfg.get("exchange", {}).get("quote_asset", "USDC"))
+    # MS6: 運用対象（実発注してよい）と、観測のみ（シャドー）を分ける。
     symbols: List[str] = list(cfg["exchange"]["symbols"])
+    shadow_syms: List[str] = shadow_symbols(cfg)
+    # データ取得・特徴量・レジーム判定はシャドー銘柄も含めて行う（Step2 が使う）
+    data_symbols: List[str] = watched_symbols(cfg)
     max_concurrent = int(cfg.get("position", {}).get("max_concurrent", 1))
     store = CandlesStore(cfg["persistence"]["candles_dir"])
     om = OrderManager(cfg)
@@ -123,6 +135,24 @@ def main() -> None:
     hc = HealthCheck()
     notifier = DiscordNotifier(cfg["notification"]["discord_webhook_url"])
     state_mgr = StateManager(cfg["persistence"]["state_file"])
+
+    # --- MS6 Step3: シグナル時点の板スナップショット ---
+    book_recorder = OrderBookRecorder(client, cfg)
+    signal_journal = SignalJournal(
+        cfg["persistence"]["signal_journal_path"],
+        mode=str(cfg.get("sizing", {}).get("risk_mode", "live")),
+    )
+    # --- MS6 Step2: 運用対象外シンボルのシャドー観測 ---
+    shadow = ShadowObserver(cfg)
+    shadow_flag_path = (cfg.get("shadow", {}) or {}).get("flag_path")
+    shadow_flag_written = False
+    last_shadow_bar_ts = None
+    shadow_bar_idx = 0
+    if shadow_syms:
+        log.info(
+            f"Shadow observation: {', '.join(shadow_syms)} "
+            f"(no orders; journal={shadow.journal_path})"
+        )
 
     # --- M4: exchange-side STOP_LOSS (安全網) ---
     # The bot keeps its own close-based trailing logic; this manager only keeps
@@ -165,7 +195,7 @@ def main() -> None:
 
     # --- Fetch lot sizes for each symbol ---
     lot_info: Dict[str, Dict[str, float]] = {}
-    for sym in symbols:
+    for sym in data_symbols:
         try:
             lot_info[sym] = client.get_lot_size(sym)
         except Exception as e:
@@ -176,6 +206,17 @@ def main() -> None:
                 "stepSize": 0.00001,
                 "minNotional": 0.0,
             }
+
+    # simulator / shadow 側のキー名（snake_case）でも引けるようにしておく。
+    # main_live 自身は上の camelCase 辞書を compute_qty に直接渡している。
+    cfg.setdefault("exchange", {})["lot_info"] = {
+        s: {
+            "step_size": float(v.get("stepSize", 0.0) or 0.0),
+            "min_qty": float(v.get("minQty", 0.0) or 0.0),
+            "min_notional": float(v.get("minNotional", 0.0) or 0.0),
+        }
+        for s, v in lot_info.items()
+    }
 
     # ===============================================================
     # Exchange-stop safety state
@@ -241,7 +282,7 @@ def main() -> None:
             feat_1h: Dict[str, Any] = {}
             feat_5m: Dict[str, Any] = {}
 
-            for sym in symbols:
+            for sym in data_symbols:
                 try:
                     # 1h: fetch last 250 bars (for indicator warmup)
                     df_1h = client.fetch_klines(sym, "1h", limit=250)
@@ -487,16 +528,51 @@ def main() -> None:
             if not blocked_this_iteration and not unprotected and not orphan_failures:
                 _release_entries("exchange stops healthy")
 
+            # --- Shadow observation (MS6 Step2): 毎時 1 回、枠と独立に回す ---
+            # 実発注はしない。シグナル→決済を仮想で追い、journal に積む。
+            at_boundary = _is_1h_boundary(now)
+            if at_boundary:
+                bar_ts = _ts_floor_1h(now)
+                if bar_ts != last_shadow_bar_ts:
+                    last_shadow_bar_ts = bar_ts
+                    shadow_bar_idx += 1
+                    try:
+                        events = shadow.on_bar(now, feat_1h, shadow_bar_idx)
+                        if events:
+                            log.info(f"Shadow events this bar: {len(events)}")
+                        if not shadow_flag_written and shadow.enabled:
+                            status = shadow.reentry_status()
+                            if status.get("eligible") and shadow_flag_path:
+                                shadow.write_flag(shadow_flag_path)
+                                shadow_flag_written = True
+                                log.warning(
+                                    f"Shadow re-entry condition met: {status['reason']} "
+                                    f"(n={status['n_trades']}, "
+                                    f"E[S0]={status['expectancy_s0']:+.1f})"
+                                )
+                    except Exception as e:
+                        log.error(f"Shadow observation failed: {e}")
+
             # --- Entry (only at 1h boundaries, and only while slots are free) ---
             free_slots = max_concurrent - len(positions)
-            if free_slots > 0 and _is_1h_boundary(now) and entries_blocked is not None:
-                log.warning(f"Entries skipped this loop: {entries_blocked}")
-            elif free_slots > 0 and _is_1h_boundary(now):
+            if free_slots > 0 and at_boundary:
                 signals = generate_signals(
                     feat_1h, feat_5m, cfg, now,
                     current_positions=list(positions.values()),
                     cooldowns=cooldowns,
                 )
+                # MS6 Step3: シグナル時点の板を記録し、シグナルと紐づけて残す。
+                # 実際に発注できたか（entries_blocked / 枠 / 残高）に関わらず記録する
+                # ので、後日「取れなかったシグナルの板」も含めて検証できる。
+                for sig in signals:
+                    signal_journal.record(
+                        sig,
+                        ts=now,
+                        orderbook=book_recorder.snapshot(sig.symbol, now),
+                    )
+                if entries_blocked is not None:
+                    log.warning(f"Entries skipped this loop: {entries_blocked}")
+                    signals = []
                 equity = 0.0
                 if signals:
                     try:

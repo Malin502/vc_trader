@@ -17,11 +17,12 @@
 
 ## 2. 取引仕様
 - 取引所: Binance Spot（`exchange.env` = prod / testnet、loader が base_url を解決）
-- シンボル: BTCJPY, ETHJPY, XRPJPY, SOLJPY（config の `exchange.symbols`）
+- シンボル: BTCJPY, ETHJPY, XRPJPY（`exchange.symbols`）。SOLJPY は運用対象外で
+  `exchange.shadow_symbols` に置き、データ取得とシグナル計算だけ継続してシャドー観測する（MS6）
 - シグナル生成: 1h足
 - 執行フィルタ: 5m足
 - 監視: 5m足（推奨）
-- 最大2ポジション（`position.max_concurrent` = 2、同一銘柄1枠まで）
+- 最大1ポジション（`position.max_concurrent` = 1、同一銘柄1枠まで。MS6 で 2枠→1枠）
 - クールダウン: 決済後24時間再エントリ禁止（STOP_LOSS は48h）
 - コスト: 往復0.30%（手数料+スリッページ）
 
@@ -54,9 +55,10 @@
 - レジームCHAOS化: 即時決済
 
 ## 8. ポジションサイズ
-- 損失上限: 1トレードあたり口座資産の2%（paper）/ 1%（live）— `sizing.risk_mode`
+- 損失上限: 1トレードあたり口座資産の1%（paper / live 共通）— `sizing.risk_mode`
 - サイズ: risk/stop_dist, lot丸め, 1枠あたり投下資金 <= 50%（`sizing.max_notional_pct`）
-- 同時シグナル時はスコア上位から空き枠（最大2）に割当、同一銘柄は二重エントリしない
+- 同時シグナル時はスコア上位から空き枠（最大1）に割当、同一銘柄は二重エントリしない
+- MaxDD 運用線: 15% で停止レビュー / 20% で運用停止（`risk.max_drawdown`。裏付けは別タスク）
 
 ## 9. システム構成
 - ディレクトリ: aivc_trade/以下にconfig,core,data,strategy,execution,backtest,ops,main

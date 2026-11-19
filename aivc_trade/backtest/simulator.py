@@ -227,6 +227,37 @@ class Simulator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def open_position(
+        self,
+        signal: Any,
+        feat_at: Dict[str, pd.DataFrame],
+        feat_1h: Dict[str, pd.DataFrame],
+        ts: datetime,
+        equity: float,
+    ) -> Optional[Position]:
+        """Public entry point for :class:`aivc_trade.ops.shadow.ShadowObserver`.
+
+        The shadow observer must size and open positions exactly like the
+        backtest so its expectancy is comparable; exposing this wrapper keeps
+        the single implementation instead of duplicating the logic.
+        """
+        return self._open_position(signal, feat_at, feat_1h, ts, equity)
+
+    def step_position(
+        self,
+        pos: Position,
+        feat_at: Dict[str, pd.DataFrame],
+        feat_1h: Dict[str, pd.DataFrame],
+        ts: datetime,
+        bar_idx: int,
+        entry_bar_idx: int,
+        equity: float,
+    ) -> Tuple[float, List[TradeRecord], bool]:
+        """Public wrapper around :meth:`_manage_open_position` (shadow use)."""
+        return self._manage_open_position(
+            pos, feat_at, feat_1h, ts, bar_idx, entry_bar_idx, equity
+        )
+
     def _bps(self, symbol: str) -> Tuple[float, float]:
         """Return ``(commission_bps, slippage_bps)`` for *symbol*.
 
