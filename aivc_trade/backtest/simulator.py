@@ -10,6 +10,7 @@ Processes 1h bars sequentially.  Key changes from Phase A:
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -63,6 +64,7 @@ class Simulator:
         self,
         candles_1h: Dict[str, pd.DataFrame],
         candles_5m: Dict[str, pd.DataFrame],
+        trade_start: Optional[datetime] = None,
     ) -> Tuple[List[TradeRecord], pd.DataFrame]:
         """Run backtest.
 
@@ -70,6 +72,9 @@ class Simulator:
         ----------
         candles_1h : {symbol: DataFrame} raw OHLCV 1h
         candles_5m : {symbol: DataFrame} raw OHLCV 5m
+        trade_start : optional datetime; bars before it are used only as
+            indicator warm-up (no positions, no equity records). This keeps the
+            evaluation window clean when the caller passes extra history.
 
         Returns
         -------
@@ -101,14 +106,27 @@ class Simulator:
             log.warning("No 1h data to simulate")
             return [], pd.DataFrame()
 
+        # ts 列をリスト化しておき、各バーの「その時点で最後の行」を bisect で O(log n)
+        # に取る。以前は毎バー `loc[df["ts"] <= ts]` で履歴全体をコピーしていたため
+        # 2 年分（2万バー超）では O(n^2) で実用時間に収まらなかった。
+        ts_lists: Dict[str, List[datetime]] = {
+            sym: df["ts"].tolist() for sym, df in feat_1h.items()
+        }
+
         # --- State ---
         equity = self.initial_equity
-        position: Optional[Position] = None
+        # M5: 複数ポジション（合計 max_concurrent 枠 / 同一銘柄 max_per_symbol 枠）。
+        # main_live.py の M3 実装と同じ規則を simulator 側でも守る:
+        #   * 枠数は cfg["position"]["max_concurrent"]（既定 2）
+        #   * 同一銘柄は 1 枠まで（dict のキー = symbol なので構造的に二重保有しない）
+        #   * 枠が空いていれば 1 バーで複数銘柄に入る（スコア上位から）
+        max_concurrent = int(self.cfg.get("position", {}).get("max_concurrent", 1))
+        positions: Dict[str, Position] = {}
+        entry_bar_idx: Dict[str, int] = {}  # {symbol: bar index at entry}
         cooldowns_bar: Dict[str, int] = {}  # {symbol: bar_idx_when_expires}
         loss_streak: Dict[str, int] = {}    # {symbol: consecutive_losses}
         trades: List[TradeRecord] = []
         equity_records: List[Dict[str, Any]] = []
-        entry_bar_idx: int = 0  # bar index when position was entered
 
         # Pre-index 5m data for quick lookup
         _5m_idx = {}
@@ -124,240 +142,75 @@ class Simulator:
         for i, ts in enumerate(timeline):
             if i < warmup:
                 continue
+            if trade_start is not None and ts < trade_start:
+                continue
 
-            # --- snapshot features at ts ---
+            # --- snapshot features at ts (last closed bar <= ts) ---
             feat_at: Dict[str, pd.DataFrame] = {}
             for sym in self.cfg["exchange"]["symbols"]:
-                if sym in feat_1h:
-                    mask = feat_1h[sym]["ts"] <= ts
-                    feat_at[sym] = feat_1h[sym].loc[mask]
+                if sym not in feat_1h:
+                    continue
+                pos_idx = bisect_right(ts_lists[sym], ts) - 1
+                if pos_idx >= 0:
+                    feat_at[sym] = feat_1h[sym].iloc[pos_idx:pos_idx + 1]
 
-            # --- If holding, check exit ---
-            if position is not None:
-                sym = position.symbol
-                if sym in feat_at and not feat_at[sym].empty:
-                    row = feat_at[sym].iloc[-1]
-                    current_close = row["close"]
-                    current_high = row["high"]
-                    current_low = row["low"]
-                    current_atr = row["atr"]
-                    current_atrp = float(row.get("atrp", 0.0))
-                    current_adx = float(row.get("adx", 0.0))
-                    trend_ma_val = float(row.get("trend_ma", 0.0))
-                    ema_slow_val = float(row.get("ema_slow", 0.0))
-                    regime = row.get("regime", Regime.RANGE)
-                    if not isinstance(regime, Regime):
-                        regime = Regime.RANGE
-
-                    # Update MFE, trail, BE
-                    position = self.pm.update_stop(
-                        position,
-                        current_close,
-                        current_atr,
-                        now=ts,
-                        current_atrp=current_atrp,
-                        current_high=current_high,
-                        current_low=current_low,
-                        current_adx=current_adx,
-                        trend_ma=trend_ma_val,
+            # --- Manage every open position (stop / partial TP / exit) ---
+            for sym in sorted(positions):
+                if sym not in feat_at or feat_at[sym].empty:
+                    continue
+                pos = positions[sym]
+                equity, emitted, closed = self._manage_open_position(
+                    pos, feat_at, feat_1h, ts, i, entry_bar_idx[sym], equity,
+                )
+                if emitted:
+                    trades.extend(emitted)
+                if closed:
+                    # クールダウンは「決済した銘柄」にだけ入れる（部分利確では入れない）。
+                    streak = loss_streak.get(sym, 0)
+                    streak = streak + 1 if emitted[-1].pnl < 0 else 0
+                    loss_streak[sym] = streak
+                    cooldowns_bar[sym] = PositionManager.compute_cooldown_bars(
+                        i, self.cooldown_bars, streak
                     )
+                    del positions[sym]
+                    entry_bar_idx.pop(sym, None)
 
-                    # --- CHAOS emergency partial TP ---
-                    if regime == Regime.CHAOS:
-                        chaos_action = self.pm.handle_chaos(
-                            position, current_close, current_atr
-                        )
-                        if chaos_action is True and not position.partial_taken:
-                            partial_exit_price = self._get_next_bar_open(
-                                feat_1h.get(sym), ts
-                            )
-                            if partial_exit_price is None:
-                                partial_exit_price = current_close
-
-                            partial_ratio = 0.5  # Emergency: take 50%
-                            partial_qty = position.initial_qty * partial_ratio
-
-                            bars_held = i - entry_bar_idx
-                            partial_trade = self._create_partial_trade_record(
-                                position, partial_qty, partial_exit_price,
-                                ts, current_close, regime, bars_held,
-                            )
-                            trades.append(partial_trade)
-                            equity += partial_trade.pnl
-
-                            position.qty -= partial_qty
-                            position.partial_taken = True
-                            position.runner_mode = True
-                            position.mode = "RUNNER"
-                            position.trail_activated = True
-                            position.partial_price = partial_exit_price
-                            position.partial_time = ts
-                            position.entry_cost = (
-                                position.entry_cost
-                                * (position.qty / (position.qty + partial_qty))
-                            )
-
-                    # --- Check normal partial TP ---
-                    elif (
-                        not position.partial_taken
-                        and self.pm.check_partial_tp(
-                            position, current_close, current_adx=current_adx, trend_ma=trend_ma_val
-                        )
-                    ):
-                        partial_exit_price = self._get_next_bar_open(
-                            feat_1h.get(sym), ts
-                        )
-                        if partial_exit_price is None:
-                            partial_exit_price = current_close
-
-                        partial_ratio = float(
-                            self.cfg.get("partial_tp", {}).get("ratio", 0.33)
-                        )
-                        partial_qty = position.initial_qty * partial_ratio
-
-                        bars_held = i - entry_bar_idx
-                        partial_trade = self._create_partial_trade_record(
-                            position, partial_qty, partial_exit_price,
-                            ts, current_close, regime, bars_held,
-                        )
-                        trades.append(partial_trade)
-                        equity += partial_trade.pnl
-
-                        # Update position state → RUNNER
-                        position.qty -= partial_qty
-                        position.partial_taken = True
-                        position.runner_mode = True
-                        position.mode = "RUNNER"
-                        position.trail_activated = True
-                        position.partial_price = partial_exit_price
-                        position.partial_time = ts
-                        position.entry_cost = (
-                            position.entry_cost
-                            * (position.qty / (position.qty + partial_qty))
-                        )
-
-                    # Check exit (pass ema_slow for RANGE condition)
-                    exit_reason = self.pm.check_exit(
-                        position, current_close, current_atr, regime, ts,
-                        ema_slow=ema_slow_val,
-                        current_adx=current_adx,
-                        trend_ma=trend_ma_val,
-                    )
-                    if exit_reason is not None:
-                        exit_price = self._get_next_bar_open(
-                            feat_1h.get(sym), ts
-                        )
-                        if exit_price is None:
-                            exit_price = current_close
-
-                        bars_held = i - entry_bar_idx
-                        trade = self._close_position(
-                            position, exit_price, ts, exit_reason, equity,
-                            regime=regime, current_close=current_close,
-                            bars_held=bars_held,
-                        )
-                        trades.append(trade)
-                        equity += trade.pnl
-
-                        # Track loss streak for cooldown
-                        sym_streak = loss_streak.get(sym, 0)
-                        if trade.pnl < 0:
-                            sym_streak += 1
-                        else:
-                            sym_streak = 0
-                        loss_streak[sym] = sym_streak
-
-                        # Bar-based cooldown
-                        cooldowns_bar[sym] = PositionManager.compute_cooldown_bars(
-                            i, self.cooldown_bars, sym_streak
-                        )
-                        position = None
-
-            # --- If flat, look for entry ---
-            if position is None:
+            # --- Entries: fill every free slot, best score first ---
+            if len(positions) < max_concurrent:
                 signals = generate_signals(
                     feat_at, {}, self.cfg, ts,
-                    current_position=position,
+                    current_positions=list(positions.values()),
                     cooldowns_bar=cooldowns_bar,
                     current_bar_idx=i,
                 )
-                if signals:
-                    best = signals[0]
-                    # Entry at next bar open
-                    entry_price = self._get_next_bar_open(
-                        feat_1h.get(best.symbol), ts
-                    )
-                    if entry_price is None:
-                        entry_price = best.entry_price
+                for best in signals:
+                    if len(positions) >= max_concurrent:
+                        break
+                    if best.symbol in positions:
+                        continue  # 同一銘柄ガード（live と同じ belt-and-braces）
+                    opened = self._open_position(best, feat_at, feat_1h, ts, equity)
+                    if opened is None:
+                        continue
+                    positions[best.symbol] = opened
+                    entry_bar_idx[best.symbol] = i
+                    equity -= opened.entry_cost
 
-                    # Recompute stop based on entry_price
-                    best.entry_price = entry_price
-                    if best.stop_price >= entry_price:
-                        best.stop_price = entry_price * 0.95  # fallback
-
-                    qty = compute_qty(
-                        best, equity, self.cfg,
-                        lot_step=0.00001 if "BTC" in best.symbol else 0.0001,
-                        min_qty=0.00001 if "BTC" in best.symbol else 0.0001,
-                    )
-                    if qty > 0:
-                        atr_at_entry = 0.0
-                        regime_at_entry_str = ""
-                        if best.symbol in feat_at:
-                            r = feat_at[best.symbol].iloc[-1]
-                            atr_at_entry = r["atr"]
-                            regime_val = r.get("regime", Regime.RANGE)
-                            if isinstance(regime_val, Regime):
-                                regime_at_entry_str = regime_val.value
-                            else:
-                                regime_at_entry_str = str(regime_val)
-
-                        entry_cost = (
-                            qty * entry_price * self.cfg["costs"]["commission_bps"] / 10_000
-                            + qty * entry_price * self.cfg["costs"]["slippage_bps"] / 10_000
-                        )
-                        planned_risk = qty * max(entry_price - best.stop_price, 0.0)
-
-                        position = Position(
-                            symbol=best.symbol,
-                            qty=qty,
-                            entry_price=entry_price,
-                            stop_price=best.stop_price,
-                            initial_stop_price=0.0,
-                            entry_ts=ts,
-                            highest_price=entry_price,
-                            lowest_price=entry_price,
-                            atr_at_entry=atr_at_entry,
-                            entry_cost=entry_cost,
-                            planned_risk=planned_risk,
-                            initial_qty=qty,
-                            regime_at_entry=regime_at_entry_str,
-                            mode="CORE",
-                            bars_since_entry=0,
-                        )
-                        # Recompute and enforce ATR-based initial stop from actual entry price.
-                        self.pm.apply_initial_stop(position, atr_at_entry)
-                        position.planned_risk = qty * max(entry_price - position.stop_price, 0.0)
-                        entry_bar_idx = i
-                        equity -= entry_cost
-
-            # --- Equity snapshot ---
+            # --- Equity snapshot (realised + unrealised of every open position) ---
             mark_equity = equity
-            if position is not None:
-                sym = position.symbol
+            for sym, pos in positions.items():
                 if sym in feat_at and not feat_at[sym].empty:
                     mark_price = feat_at[sym].iloc[-1]["close"]
-                    mark_equity += position.qty * (mark_price - position.entry_price)
+                    mark_equity += pos.qty * (mark_price - pos.entry_price)
 
             equity_records.append({"ts": ts, "equity": mark_equity})
 
-        # --- Force-close if still holding at end ---
-        if position is not None:
-            sym = position.symbol
-            last_close = feat_1h[sym].iloc[-1]["close"] if sym in feat_1h else position.entry_price
-            bars_held = len(timeline) - 1 - entry_bar_idx
+        # --- Force-close whatever is still open at the end ---
+        for sym in sorted(positions):
+            pos = positions[sym]
+            last_close = feat_1h[sym].iloc[-1]["close"] if sym in feat_1h else pos.entry_price
+            bars_held = len(timeline) - 1 - entry_bar_idx[sym]
             trade = self._close_position(
-                position, last_close, timeline[-1], ExitReason.MANUAL, equity,
+                pos, last_close, timeline[-1], ExitReason.MANUAL, equity,
                 regime=Regime.RANGE, current_close=last_close,
                 bars_held=bars_held,
             )
@@ -374,6 +227,267 @@ class Simulator:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def open_position(
+        self,
+        signal: Any,
+        feat_at: Dict[str, pd.DataFrame],
+        feat_1h: Dict[str, pd.DataFrame],
+        ts: datetime,
+        equity: float,
+    ) -> Optional[Position]:
+        """Public entry point for :class:`aivc_trade.ops.shadow.ShadowObserver`.
+
+        The shadow observer must size and open positions exactly like the
+        backtest so its expectancy is comparable; exposing this wrapper keeps
+        the single implementation instead of duplicating the logic.
+        """
+        return self._open_position(signal, feat_at, feat_1h, ts, equity)
+
+    def step_position(
+        self,
+        pos: Position,
+        feat_at: Dict[str, pd.DataFrame],
+        feat_1h: Dict[str, pd.DataFrame],
+        ts: datetime,
+        bar_idx: int,
+        entry_bar_idx: int,
+        equity: float,
+    ) -> Tuple[float, List[TradeRecord], bool]:
+        """Public wrapper around :meth:`_manage_open_position` (shadow use)."""
+        return self._manage_open_position(
+            pos, feat_at, feat_1h, ts, bar_idx, entry_bar_idx, equity
+        )
+
+    def _bps(self, symbol: str) -> Tuple[float, float]:
+        """Return ``(commission_bps, slippage_bps)`` for *symbol*.
+
+        ``costs.slippage_bps_by_symbol`` (optional) overrides the flat
+        ``costs.slippage_bps`` per symbol, so a measured spread table can be
+        applied without touching the default cost model.
+        """
+        costs = self.cfg["costs"]
+        commission = float(costs["commission_bps"])
+        per_symbol = costs.get("slippage_bps_by_symbol") or {}
+        slippage = float(per_symbol.get(symbol, costs["slippage_bps"]))
+        return commission, slippage
+
+    def _lot_params(self, symbol: str) -> Tuple[float, float, float]:
+        """Return ``(lot_step, min_qty, min_notional)`` for *symbol*.
+
+        Real exchangeInfo filters can be injected via
+        ``exchange.lot_info[symbol] = {step_size, min_qty, min_notional}``;
+        otherwise the legacy heuristic is used so older callers/tests keep
+        working unchanged.
+        """
+        info = (self.cfg.get("exchange", {}).get("lot_info") or {}).get(symbol) or {}
+        default_step = 0.00001 if "BTC" in symbol else 0.0001
+        step = float(info.get("step_size", default_step))
+        min_qty = float(info.get("min_qty", default_step))
+        min_notional = float(info.get("min_notional", 0.0))
+        return step, min_qty, min_notional
+
+    def _open_position(
+        self,
+        signal: Any,
+        feat_at: Dict[str, pd.DataFrame],
+        feat_1h: Dict[str, pd.DataFrame],
+        ts: datetime,
+        equity: float,
+    ) -> Optional[Position]:
+        """Size and build one position from *signal*. ``None`` = no entry."""
+        entry_price = self._get_next_bar_open(feat_1h.get(signal.symbol), ts)
+        if entry_price is None:
+            entry_price = signal.entry_price
+
+        # Recompute stop based on entry_price
+        signal.entry_price = entry_price
+        if signal.stop_price >= entry_price:
+            signal.stop_price = entry_price * 0.95  # fallback
+
+        lot_step, min_qty, min_notional = self._lot_params(signal.symbol)
+        qty = compute_qty(
+            signal, equity, self.cfg,
+            lot_step=lot_step,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        )
+        if qty <= 0:
+            return None
+
+        atr_at_entry = 0.0
+        regime_at_entry_str = ""
+        if signal.symbol in feat_at and not feat_at[signal.symbol].empty:
+            r = feat_at[signal.symbol].iloc[-1]
+            atr_at_entry = r["atr"]
+            regime_val = r.get("regime", Regime.RANGE)
+            if isinstance(regime_val, Regime):
+                regime_at_entry_str = regime_val.value
+            else:
+                regime_at_entry_str = str(regime_val)
+
+        commission_bps, slippage_bps = self._bps(signal.symbol)
+        entry_cost = (
+            qty * entry_price * commission_bps / 10_000
+            + qty * entry_price * slippage_bps / 10_000
+        )
+        planned_risk = qty * max(entry_price - signal.stop_price, 0.0)
+
+        position = Position(
+            symbol=signal.symbol,
+            qty=qty,
+            entry_price=entry_price,
+            stop_price=signal.stop_price,
+            initial_stop_price=0.0,
+            entry_ts=ts,
+            highest_price=entry_price,
+            lowest_price=entry_price,
+            atr_at_entry=atr_at_entry,
+            entry_cost=entry_cost,
+            planned_risk=planned_risk,
+            initial_qty=qty,
+            regime_at_entry=regime_at_entry_str,
+            mode="CORE",
+            bars_since_entry=0,
+        )
+        # Recompute and enforce ATR-based initial stop from actual entry price.
+        self.pm.apply_initial_stop(position, atr_at_entry)
+        position.planned_risk = qty * max(entry_price - position.stop_price, 0.0)
+        return position
+
+    def _manage_open_position(
+        self,
+        pos: Position,
+        feat_at: Dict[str, pd.DataFrame],
+        feat_1h: Dict[str, pd.DataFrame],
+        ts: datetime,
+        bar_idx: int,
+        entry_bar_idx: int,
+        equity: float,
+    ) -> Tuple[float, List[TradeRecord], bool]:
+        """Advance one open position by a bar.
+
+        Returns ``(equity, trades_emitted, closed)`` where *trades_emitted* are
+        the realised TradeRecords (partial TP and/or the final exit) and
+        *closed* says whether the position was fully exited on this bar.
+        """
+        sym = pos.symbol
+        emitted: List[TradeRecord] = []
+        if sym not in feat_at or feat_at[sym].empty:
+            return equity, emitted, False
+
+        row = feat_at[sym].iloc[-1]
+        current_close = row["close"]
+        current_high = row["high"]
+        current_low = row["low"]
+        current_atr = row["atr"]
+        current_atrp = float(row.get("atrp", 0.0))
+        current_adx = float(row.get("adx", 0.0))
+        trend_ma_val = float(row.get("trend_ma", 0.0))
+        ema_slow_val = float(row.get("ema_slow", 0.0))
+        regime = row.get("regime", Regime.RANGE)
+        if not isinstance(regime, Regime):
+            regime = Regime.RANGE
+
+        # Update MFE, trail, BE
+        pos = self.pm.update_stop(
+            pos,
+            current_close,
+            current_atr,
+            now=ts,
+            current_atrp=current_atrp,
+            current_high=current_high,
+            current_low=current_low,
+            current_adx=current_adx,
+            trend_ma=trend_ma_val,
+        )
+
+        # --- CHAOS emergency partial TP ---
+        if regime == Regime.CHAOS:
+            chaos_action = self.pm.handle_chaos(pos, current_close, current_atr)
+            if chaos_action is True and not pos.partial_taken:
+                partial_exit_price = self._get_next_bar_open(feat_1h.get(sym), ts)
+                if partial_exit_price is None:
+                    partial_exit_price = current_close
+
+                partial_ratio = 0.5  # Emergency: take 50%
+                partial_qty = pos.initial_qty * partial_ratio
+
+                partial_trade = self._create_partial_trade_record(
+                    pos, partial_qty, partial_exit_price,
+                    ts, current_close, regime, bar_idx - entry_bar_idx,
+                )
+                emitted.append(partial_trade)
+                equity += partial_trade.pnl
+
+                pos.qty -= partial_qty
+                pos.partial_taken = True
+                pos.runner_mode = True
+                pos.mode = "RUNNER"
+                pos.trail_activated = True
+                pos.partial_price = partial_exit_price
+                pos.partial_time = ts
+                pos.entry_cost = (
+                    pos.entry_cost * (pos.qty / (pos.qty + partial_qty))
+                )
+
+        # --- Check normal partial TP ---
+        elif (
+            not pos.partial_taken
+            and self.pm.check_partial_tp(
+                pos, current_close, current_adx=current_adx, trend_ma=trend_ma_val
+            )
+        ):
+            partial_exit_price = self._get_next_bar_open(feat_1h.get(sym), ts)
+            if partial_exit_price is None:
+                partial_exit_price = current_close
+
+            partial_ratio = float(
+                self.cfg.get("partial_tp", {}).get("ratio", 0.33)
+            )
+            partial_qty = pos.initial_qty * partial_ratio
+
+            partial_trade = self._create_partial_trade_record(
+                pos, partial_qty, partial_exit_price,
+                ts, current_close, regime, bar_idx - entry_bar_idx,
+            )
+            emitted.append(partial_trade)
+            equity += partial_trade.pnl
+
+            # Update position state → RUNNER
+            pos.qty -= partial_qty
+            pos.partial_taken = True
+            pos.runner_mode = True
+            pos.mode = "RUNNER"
+            pos.trail_activated = True
+            pos.partial_price = partial_exit_price
+            pos.partial_time = ts
+            pos.entry_cost = (
+                pos.entry_cost * (pos.qty / (pos.qty + partial_qty))
+            )
+
+        # Check exit (pass ema_slow for RANGE condition)
+        exit_reason = self.pm.check_exit(
+            pos, current_close, current_atr, regime, ts,
+            ema_slow=ema_slow_val,
+            current_adx=current_adx,
+            trend_ma=trend_ma_val,
+        )
+        if exit_reason is None:
+            return equity, emitted, False
+
+        exit_price = self._get_next_bar_open(feat_1h.get(sym), ts)
+        if exit_price is None:
+            exit_price = current_close
+
+        trade = self._close_position(
+            pos, exit_price, ts, exit_reason, equity,
+            regime=regime, current_close=current_close,
+            bars_held=bar_idx - entry_bar_idx,
+        )
+        emitted.append(trade)
+        equity += trade.pnl
+        return equity, emitted, True
+
     def _get_cooldown_hours(self, exit_reason: ExitReason) -> int:
         """Return cooldown hours based on exit reason (legacy)."""
         if exit_reason == ExitReason.STOP_LOSS:
@@ -404,10 +518,11 @@ class Simulator:
         bars_held: int = 0,
     ) -> TradeRecord:
         """Create a TradeRecord for a partial take-profit event."""
+        commission_bps, slippage_bps = self._bps(pos.symbol)
         entry_cost_partial = pos.entry_cost * (partial_qty / pos.initial_qty)
         exit_cost = (
-            partial_qty * exit_price * self.cfg["costs"]["commission_bps"] / 10_000
-            + partial_qty * exit_price * self.cfg["costs"]["slippage_bps"] / 10_000
+            partial_qty * exit_price * commission_bps / 10_000
+            + partial_qty * exit_price * slippage_bps / 10_000
         )
         raw_pnl = partial_qty * (exit_price - pos.entry_price)
         net_pnl = raw_pnl - entry_cost_partial - exit_cost
@@ -467,9 +582,10 @@ class Simulator:
         current_close: float = 0.0,
         bars_held: int = 0,
     ) -> TradeRecord:
+        commission_bps, slippage_bps = self._bps(pos.symbol)
         exit_cost = (
-            pos.qty * exit_price * self.cfg["costs"]["commission_bps"] / 10_000
-            + pos.qty * exit_price * self.cfg["costs"]["slippage_bps"] / 10_000
+            pos.qty * exit_price * commission_bps / 10_000
+            + pos.qty * exit_price * slippage_bps / 10_000
         )
         raw_pnl = pos.qty * (exit_price - pos.entry_price)
         net_pnl = raw_pnl - pos.entry_cost - exit_cost

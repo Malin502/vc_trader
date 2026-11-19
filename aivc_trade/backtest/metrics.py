@@ -35,6 +35,102 @@ def _compute_sharpe_from_curve(equity_curve: pd.DataFrame) -> float:
     return float((daily_ret.mean() / daily_ret.std()) * np.sqrt(365))
 
 
+# ----------------------------------------------------------------------
+# Breakeven slippage (MS6 Step 4 – バックテスト報告の標準指標)
+# ----------------------------------------------------------------------
+def position_cost_rows(trades: List[TradeRecord]) -> pd.DataFrame:
+    """Aggregate trade records into one row per position with cost basis.
+
+    A position may have several records (partial TP + final exit).  For the
+    breakeven calculation we need, per position:
+
+    * ``gross_pnl``      – sum of gross PnL over the legs
+    * ``notional_units`` – Σ(qty × price) over every leg (entry legs + exit
+      legs).  Both commission and slippage are charged per side, so
+      ``slippage_bps × notional_units / 1e4`` is exactly the extra cost of
+      *one* bps of one-way slippage on the whole round trip.
+    """
+    buckets: Dict[tuple, Dict[str, float]] = {}
+    for t in trades:
+        key = (t.symbol, t.entry_ts)
+        row = buckets.setdefault(
+            key, {"gross_pnl": 0.0, "notional_units": 0.0, "net_pnl": 0.0}
+        )
+        row["gross_pnl"] += float(t.gross_pnl or 0.0)
+        row["notional_units"] += float(t.qty) * float(t.entry_price) + float(
+            t.qty
+        ) * float(t.exit_price)
+        row["net_pnl"] += float(t.net_pnl if t.net_pnl is not None else t.pnl)
+
+    rows = [
+        {
+            "symbol": sym,
+            "entry_ts": entry_ts,
+            "gross_pnl": v["gross_pnl"],
+            "notional_units": v["notional_units"],
+            "net_pnl_recorded": v["net_pnl"],
+        }
+        for (sym, entry_ts), v in buckets.items()
+    ]
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("entry_ts").reset_index(drop=True)
+    return df
+
+
+def profit_factor_at_slippage(
+    rows: pd.DataFrame, slippage_bps: float, commission_bps: float = 10.0
+) -> float:
+    """Profit factor when one-way slippage is *slippage_bps* on every leg.
+
+    Costs are linear in the notional, so the net PnL of each position moves by
+    ``-(commission_bps + slippage_bps) × notional_units / 1e4`` relative to the
+    gross PnL.  Commission is held fixed at *commission_bps*.
+    """
+    if rows is None or rows.empty:
+        return 0.0
+    per_bps = (float(commission_bps) + float(slippage_bps)) / 10_000.0
+    net = rows["gross_pnl"].astype(float) - per_bps * rows["notional_units"].astype(float)
+    wins = net[net > 0].sum()
+    losses = abs(net[net <= 0].sum())
+    if losses <= 0:
+        return float("inf") if wins > 0 else 0.0
+    return float(wins / losses)
+
+
+def breakeven_slippage_bps(
+    rows: pd.DataFrame,
+    commission_bps: float = 10.0,
+    upper_bps: float = 1000.0,
+    tol: float = 1e-3,
+) -> float:
+    """One-way slippage (bps) at which the profit factor equals 1.0.
+
+    Bisection on ``profit_factor_at_slippage``.  Returns
+
+    * ``0.0``    – PF(0) <= 1 (already at or below breakeven with no slippage)
+    * ``inf``    – PF stays > 1 up to *upper_bps* (breakeven not reachable)
+    * the value  – otherwise (monotone decreasing PF in slippage)
+    """
+    if rows is None or rows.empty:
+        return 0.0
+
+    pf_zero = profit_factor_at_slippage(rows, 0.0, commission_bps)
+    if pf_zero <= 1.0:
+        return 0.0
+    if profit_factor_at_slippage(rows, upper_bps, commission_bps) > 1.0:
+        return float("inf")
+
+    lo, hi = 0.0, float(upper_bps)
+    while hi - lo > tol:
+        mid = (lo + hi) / 2.0
+        if profit_factor_at_slippage(rows, mid, commission_bps) > 1.0:
+            lo = mid
+        else:
+            hi = mid
+    return float((lo + hi) / 2.0)
+
+
 def _losing_streaks(pnls: List[float]) -> List[int]:
     streaks: List[int] = []
     run = 0

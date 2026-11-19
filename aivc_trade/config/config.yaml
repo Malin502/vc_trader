@@ -4,9 +4,24 @@
 
 exchange:
   name: binance
+  # prod | testnet — loader.resolve_base_url() が接続先を切り替える
+  env: prod
+  # prod 用 API ホスト。Binance Japan の公式サービスはグローバル基盤
+  # (binance.com/ja) 上にあり、API も api.binance.com が正。
+  # （binance.co.jp はお名前.com の駐車ドメインで、api.binance.co.jp は
+  #   実在しないホストだったため M2 の空欄をここで確定した）
+  base_url: "https://api.binance.com"
+  testnet_base_url: "https://testnet.binance.vision"
+  quote_asset: JPY            # 建て通貨（残高取得・base asset 判定に使用）
+  # 運用対象（MS6 で 1枠化・SOL 除外。仕様 v2 §8）
   symbols:
-    - BTCUSDC
-    - ETHUSDC
+    - BTCJPY
+    - ETHJPY
+    - XRPJPY
+  # 運用対象外だがデータ取得・シグナル計算を継続する銘柄（MS6 Step2 のシャドー観測用）。
+  # シグナルが出ても実注文は出さず、ops/shadow.py が仮想トレードとして記録する。
+  shadow_symbols:
+    - SOLJPY
   market_type: spot          # 現物のみ
 
 timeframes:
@@ -15,7 +30,8 @@ timeframes:
   monitor: 5m                # ストップ更新監視足
 
 position:
-  max_concurrent: 2          # 同時保有最大数
+  max_concurrent: 1          # 同時保有最大数（MS6: 2枠→1枠。M5 §6.1 の 1枠優位を採用）
+  max_per_symbol: 1          # 同一銘柄の同時保有上限
   cooldown_hours: 24         # 決済後の再エントリ禁止(h) ※後方互換用
   stop_loss_cooldown_hours: 48
   regime_exit_cooldown_hours: 24
@@ -101,6 +117,13 @@ risk:
   stop_structure_buffer: 0.3   # max(ATR stop, swing_low - 0.3*ATR)
   be_activate_pct: 1.5         # 旧キー（後方互換）
   fee_buffer_bps: 8            # BE移動時の手数料バッファ
+  # MaxDD の運用線（仕様 v2。モンテカルロ裏付けは別タスク）
+  #   review_line_pct : ここに達したら停止レビュー（新規エントリ停止の判断材料）
+  #   safe_line_pct   : 安全線。ここに達したら運用停止
+  # equity ピークからのドローダウン率（正の値で表す）で比較する。
+  max_drawdown:
+    review_line_pct: 0.15
+    safe_line_pct: 0.20
   initial_sl:
     enabled: true
     sl_atr_k: 2.0
@@ -162,9 +185,14 @@ exit_tuning:
     apply_to_core: true
 
 # ---------- Position Sizing ----------
+# 仕様 v2（MS6 改訂）: ライブもペーパーも 1% に統一する。
+# 従来 paper 2% は max_notional_pct=0.5 が常に先に効き、実効 1.18% で動いていた
+# （M5 §6.2）。値を揃えて「見かけのリスク」と「実効リスク」の乖離を消す。
 sizing:
-  risk_per_trade: 0.08       # 口座資産の 8%（高リスク高リターン）
-  max_notional_pct: 1.00     # 最大投下比率
+  risk_mode: paper           # paper | live
+  risk_per_trade_paper: 0.01 # 口座資産の 1%（ライブと同一値）
+  risk_per_trade_live: 0.01  # 口座資産の 1%（実弾初期）
+  max_notional_pct: 0.50     # 1枠あたり投下比率ガード
 
 # ---------- Symbol Score Weights ----------
 score:
@@ -176,6 +204,17 @@ score:
 order:
   type: MARKET               # MARKET / LIMIT
   max_entry_slippage_bps: 15
+
+# ---------- Exchange-side Stop Orders (M2 基盤・main_live へは未結線) ----------
+stop_order:
+  enabled: true
+  order_type: STOP_LOSS      # STOP_LOSS | STOP_LOSS_LIMIT
+  client_order_prefix: aivc-sl
+  limit_offset_pct: 0.10     # STOP_LOSS_LIMIT 時の指値オフセット（stop から下, %）
+  # 取引所側 stop を bot の stop より何%下に置くか（安全網のクッション）。
+  # bot の手仕舞いは終値ベースなので、同じ価格に置くとザラ場のタッチで取引所側が
+  # 先に約定し、bot 側の制御が効かなくなる。0 で完全一致（＝挙動が変わる）。
+  safety_buffer_pct: 0.3
 
 # ---------- Circuit Breaker ----------
 circuit_breaker:
@@ -195,11 +234,35 @@ persistence:
   state_file: data/position_state.json
   candles_dir: data/candles
   log_dir: logs
+  # MS6 Step3: シグナル時点の板スナップショットを紐づけて残すジャーナル
+  signal_journal_path: data/signals/signal_journal.jsonl
+
+# ---------- Shadow observation (MS6 Step2) ----------
+# 運用対象外シンボル（exchange.shadow_symbols）のシグナルを実注文なしで追跡し、
+# 再入場判断に必要な統計が溜まったらフラグを立てる。蓄積は連続運転で行う。
+shadow:
+  enabled: true
+  journal_path: data/shadow/shadow_trades.jsonl
+  flag_path: data/shadow/reentry_flag.json   # 再入場条件を満たしたときの判定結果
+  # 再入場条件: 新規シャドーが min_trades 件以上、かつ S0（片道 slippage_bps +
+  # commission_bps）前提の期待値 > 0
+  min_trades: 20
+  slippage_bps: 5.0          # S0 の片道スリッページ
+  commission_bps: 10.0       # 片道手数料
+  initial_equity: 100000.0   # シャドーの仮想資金（サイズ計算用）
+  cooldown_bars: 0           # 0 = position.cooldown/entry.cooldown_bars に従う
+
+# ---------- Signal-time order book snapshot (MS6 Step3) ----------
+orderbook:
+  enabled: true
+  depth_limit: 100           # /api/v3/depth の limit（板の階層数）
+  bands_pct: [0.5, 1.0]      # 厚みを測る mid からの距離（%）
+  timeout_s: 5.0             # 取得失敗でシグナル処理を止めない
 
 # ---------- Backtest ----------
 backtest:
   data_dir: data/candles
-  initial_equity: 100000.0    # USDC
+  initial_equity: 100000.0    # JPY
   start_date: "2023-03-13"
   end_date: "2025-12-31"
   walkforward: false          # true: walk-forward分析を実行

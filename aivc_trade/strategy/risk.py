@@ -9,6 +9,62 @@ from aivc_trade.core.logger import get_logger
 
 log = get_logger("risk")
 
+#: MaxDD 判定（仕様 v2 の運用線）
+DD_OK = "OK"
+DD_REVIEW = "REVIEW"   # 停止レビュー線に到達
+DD_HALT = "HALT"       # 安全線に到達（運用停止）
+
+
+def drawdown_fraction(peak_equity: float, equity: float) -> float:
+    """Return the drawdown from *peak_equity* as a positive fraction.
+
+    ``peak_equity <= 0`` or ``equity > peak`` → 0.0.
+    """
+    if peak_equity is None or peak_equity <= 0:
+        return 0.0
+    dd = (float(peak_equity) - float(equity)) / float(peak_equity)
+    return max(0.0, dd)
+
+
+def classify_drawdown(dd: float, cfg: Dict[str, Any]) -> str:
+    """Classify a positive drawdown fraction against ``risk.max_drawdown``.
+
+    The two lines are checked in order: the safety line (halt) first, then the
+    review line.  Missing config → ``DD_OK`` (the lines are opt-in).
+    """
+    dd_cfg = (cfg.get("risk", {}) or {}).get("max_drawdown") or {}
+    safe = float(dd_cfg.get("safe_line_pct", 0.20))
+    review = float(dd_cfg.get("review_line_pct", 0.15))
+    if dd >= safe:
+        return DD_HALT
+    if dd >= review:
+        return DD_REVIEW
+    return DD_OK
+
+
+def drawdown_status(
+    equity_snapshots: List[Dict[str, Any]],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Peak-to-last drawdown of an equity snapshot series + its verdict."""
+    values: List[float] = []
+    for snap in equity_snapshots or []:
+        try:
+            values.append(float(snap["equity"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not values:
+        return {"peak_equity": 0.0, "equity": 0.0, "drawdown": 0.0, "level": DD_OK}
+    peak = max(values)
+    current = values[-1]
+    dd = drawdown_fraction(peak, current)
+    return {
+        "peak_equity": peak,
+        "equity": current,
+        "drawdown": dd,
+        "level": classify_drawdown(dd, cfg),
+    }
+
 
 class CircuitBreaker:
     """Monitor equity snapshots and halt trading if loss limits are breached."""
