@@ -20,7 +20,7 @@ if __package__ in (None, ""):
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from aivc_trade.config.loader import load_config
+from aivc_trade.config.loader import load_config, resolve_base_url
 from aivc_trade.core.clock import clock
 from aivc_trade.core.logger import get_logger, setup_logger
 from aivc_trade.core.types import ExitReason, Position, Regime, Side, SystemState
@@ -104,7 +104,12 @@ def main() -> None:
     api_key = cfg.get("secrets", {}).get("api_key", os.environ.get("BINANCE_API_KEY", ""))
     api_secret = cfg.get("secrets", {}).get("api_secret", os.environ.get("BINANCE_API_SECRET", ""))
 
-    client = BinanceClient(api_key=api_key, api_secret=api_secret)
+    # Endpoint comes from config (exchange.env → base_url / testnet_base_url) with
+    # AIVC_EXCHANGE_ENV / BINANCE_BASE_URL as env overrides, so switching to the
+    # testnet for the M4b run needs no code change.
+    base_url = resolve_base_url(cfg)
+    client = BinanceClient(api_key=api_key, api_secret=api_secret, base_url=base_url)
+    log.info(f"Exchange endpoint: {base_url} (env={cfg['exchange']['env']})")
     # Quote asset is config-driven so the symbol set can change (JPY pairs) without
     # touching the loop. Default keeps the historical USDC behaviour.
     quote_asset = str(cfg.get("exchange", {}).get("quote_asset", "USDC"))

@@ -584,12 +584,13 @@ def _seed_position(cfg, **overrides) -> Position:
     return position
 
 
-def _run_once(monkeypatch, cfg, exchange, signals):
+def _run_once(monkeypatch, cfg, exchange, signals, client_factory=None):
     """Run ``main_live.main()`` for exactly one loop iteration."""
     from aivc_trade import main_live
 
+    factory = client_factory or (lambda *a, **kw: exchange)
     monkeypatch.setattr(main_live, "load_config", lambda: cfg)
-    monkeypatch.setattr(main_live, "BinanceClient", lambda *a, **kw: exchange)
+    monkeypatch.setattr(main_live, "BinanceClient", factory)
     monkeypatch.setattr(main_live, "compute_features_1h", _fake_features)
     monkeypatch.setattr(main_live, "compute_features_5m", _fake_features)
     monkeypatch.setattr(main_live, "classify_regime", lambda row, cfg: Regime.TREND_UP)
@@ -808,6 +809,39 @@ class TestExitCleanup:
 
         assert "cancel" in exchange.kinds()
         assert [c for c in exchange.all("market") if c["side"] == "BUY"] == []
+
+
+class TestEndpointWiring:
+    def test_client_uses_the_configured_base_url(self, monkeypatch, tmp_path):
+        cfg = _cfg(tmp_path)
+        cfg["exchange"]["base_url"] = "https://api.binance.com"
+        exchange = FakeExchange({SYMBOL: PRICE}, [], [])
+        seen: Dict[str, Any] = {}
+
+        def factory(**kwargs):
+            seen.update(kwargs)
+            return exchange
+
+        _run_once(monkeypatch, cfg, exchange, [], client_factory=factory)
+
+        assert seen["base_url"] == "https://api.binance.com"
+
+    def test_testnet_env_switches_the_endpoint_without_code_change(
+        self, monkeypatch, tmp_path
+    ):
+        cfg = _cfg(tmp_path)
+        cfg["exchange"]["env"] = "testnet"
+        cfg["exchange"]["testnet_base_url"] = "https://testnet.binance.vision"
+        exchange = FakeExchange({SYMBOL: PRICE}, [], [])
+        seen: Dict[str, Any] = {}
+
+        def factory(**kwargs):
+            seen.update(kwargs)
+            return exchange
+
+        _run_once(monkeypatch, cfg, exchange, [], client_factory=factory)
+
+        assert seen["base_url"] == "https://testnet.binance.vision"
 
 
 class TestStartupReconciliation:
