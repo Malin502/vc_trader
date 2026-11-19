@@ -3,3 +3,5 @@ features/*
 /datasets/*
 /artifacts/*
 /.venv/
+.env.testnet
+
