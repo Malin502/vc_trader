@@ -12,8 +12,9 @@ import signal
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Allow `python aivc_trade/main_live.py` from any cwd.
 if __package__ in (None, ""):
@@ -22,6 +23,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aivc_trade.config.loader import (
+    is_paper_env,
     load_config,
     resolve_base_url,
     shadow_symbols,
@@ -31,17 +33,30 @@ from aivc_trade.core.clock import clock
 from aivc_trade.core.logger import get_logger, setup_logger
 from aivc_trade.core.types import ExitReason, Position, Regime, Side, SystemState
 from aivc_trade.data.binance_client import BinanceClient
+from aivc_trade.data.public_client import PublicMarketClient
 from aivc_trade.data.candles_store import CandlesStore
 from aivc_trade.data.feature_engine import compute_features_1h, compute_features_5m
 from aivc_trade.data.orderbook import OrderBookRecorder
+from aivc_trade.data.daily_bars import DailyBarCache
 from aivc_trade.strategy.regime import classify_regime
+from aivc_trade.strategy.gates import daily_gates_enabled
 from aivc_trade.strategy.signal import generate_signals
+from aivc_trade.strategy.htf_gate import G3Tracker, g3_config
+from aivc_trade.strategy.whipsaw_live import (
+    STATE_DATA_ERROR,
+    STATE_INSUFFICIENT,
+    W2Tracker,
+    w2_config,
+)
 from aivc_trade.strategy.sizing import compute_qty, round_down_step
 from aivc_trade.strategy.risk import CircuitBreaker
 from aivc_trade.execution.order_manager import OrderManager
 from aivc_trade.execution.position_manager import PositionManager
+from aivc_trade.execution.paper_broker import PaperBroker
+from aivc_trade.execution.paper_stop import PaperStopManager
 from aivc_trade.execution.stop_order_manager import StopOrderManager
 from aivc_trade.execution.broker import LiveBroker
+from aivc_trade.ops.config_snapshot import build_config_snapshot
 from aivc_trade.ops.healthcheck import HealthCheck
 from aivc_trade.ops.notifier import DiscordNotifier
 from aivc_trade.ops.persistence import StateManager
@@ -145,6 +160,75 @@ def _resize_exchange_stop(
     return bool(state is not None and state.is_open)
 
 
+@dataclass
+class ExchangeStack:
+    """``exchange.env`` に応じた実行系の束.
+
+    ``paper`` では ``client`` が公開データ専用クライアント、``broker`` が模擬
+    ブローカー、``stop_om`` が模擬 STOP、``account`` が仮想口座（残高照会用）。
+    ``prod`` / ``testnet`` は従来どおり署名クライアント + 実発注。
+    """
+
+    env: str
+    is_paper: bool
+    base_url: str
+    client: Any
+    broker: Any
+    stop_om: Any
+    account: Any
+
+
+def build_exchange_stack(
+    cfg: Dict[str, Any],
+    *,
+    alert_fn: Optional[Callable[[str], None]] = None,
+) -> ExchangeStack:
+    """実板ペーパー / testnet / prod の実行系を env から組み立てる.
+
+    安全ガード（実板ペーパー）:
+
+    * ``exchange.env: paper`` では **API キーを一切読まない**（config の
+      ``secrets`` も環境変数も参照しない）
+    * 生成するのは :class:`PublicMarketClient` のみで、署名コードを持たない
+    * 発注経路は :class:`PaperBroker`、保護は :class:`PaperStopManager`
+    """
+    env = str((cfg.get("exchange", {}) or {}).get("env") or "prod").strip().lower()
+    base_url = resolve_base_url(cfg)
+
+    if env == "paper":
+        client = PublicMarketClient(base_url=base_url)
+        broker = PaperBroker(client, cfg)
+        stop_om = PaperStopManager(cfg)
+        log.info(
+            "PAPER mode: public endpoints only (no API key, no signed client, "
+            "fills simulated against the real book)"
+        )
+        return ExchangeStack(
+            env=env,
+            is_paper=True,
+            base_url=base_url,
+            client=client,
+            broker=broker,
+            stop_om=stop_om,
+            account=broker,
+        )
+
+    api_key = cfg.get("secrets", {}).get("api_key", os.environ.get("BINANCE_API_KEY", ""))
+    api_secret = cfg.get("secrets", {}).get(
+        "api_secret", os.environ.get("BINANCE_API_SECRET", "")
+    )
+    client = BinanceClient(api_key=api_key, api_secret=api_secret, base_url=base_url)
+    return ExchangeStack(
+        env=env,
+        is_paper=False,
+        base_url=base_url,
+        client=client,
+        broker=LiveBroker(client, cfg),
+        stop_om=StopOrderManager(client, cfg, alert_fn=alert_fn),
+        account=client,
+    )
+
+
 def main() -> None:
     setup_logger()
     _install_signal_handlers()
@@ -155,15 +239,6 @@ def main() -> None:
     log.info("=" * 50)
 
     # --- Initialise components ---
-    api_key = cfg.get("secrets", {}).get("api_key", os.environ.get("BINANCE_API_KEY", ""))
-    api_secret = cfg.get("secrets", {}).get("api_secret", os.environ.get("BINANCE_API_SECRET", ""))
-
-    # Endpoint comes from config (exchange.env → base_url / testnet_base_url) with
-    # AIVC_EXCHANGE_ENV / BINANCE_BASE_URL as env overrides, so switching to the
-    # testnet for the M4b run needs no code change.
-    base_url = resolve_base_url(cfg)
-    client = BinanceClient(api_key=api_key, api_secret=api_secret, base_url=base_url)
-    log.info(f"Exchange endpoint: {base_url} (env={cfg['exchange']['env']})")
     # Quote asset is config-driven so the symbol set can change (JPY pairs) without
     # touching the loop. Default keeps the historical USDC behaviour.
     quote_asset = str(cfg.get("exchange", {}).get("quote_asset", "USDC"))
@@ -176,29 +251,34 @@ def main() -> None:
     store = CandlesStore(cfg["persistence"]["candles_dir"])
     om = OrderManager(cfg)
     pm = PositionManager(cfg)
-    broker = LiveBroker(client, cfg)
     cb = CircuitBreaker(cfg)
     hc = HealthCheck()
     notifier = DiscordNotifier(cfg["notification"]["discord_webhook_url"])
     state_mgr = StateManager(cfg["persistence"]["state_file"])
+    paper = is_paper_env(cfg)
 
     # --- MS6 Step3: シグナル時点の板スナップショット ---
-    book_recorder = OrderBookRecorder(client, cfg)
+    # ジャーナルは実行系より先に作る。実板ペーパーでは全レコードに
+    # ``venue=paper_mock`` を付け、実約定と機械的に区別できるようにする。
     signal_journal = SignalJournal(
         cfg["persistence"]["signal_journal_path"],
         mode=str(cfg.get("sizing", {}).get("risk_mode", "live")),
+        defaults={"venue": "paper_mock", "execution": "simulated"} if paper else None,
     )
-    # --- MS6 Step2: 運用対象外シンボルのシャドー観測 ---
-    shadow = ShadowObserver(cfg)
-    shadow_flag_path = (cfg.get("shadow", {}) or {}).get("flag_path")
-    shadow_flag_written = False
-    last_shadow_bar_ts = None
-    shadow_bar_idx = 0
-    if shadow_syms:
-        log.info(
-            f"Shadow observation: {', '.join(shadow_syms)} "
-            f"(no orders; journal={shadow.journal_path})"
+
+    # --- 起動時の構成をジャーナルに残す（期間ごとの構成の再構成用） ---
+    # 「その期間に有効だった構成（G3 のみ / G3＋W2 等）」を後から言えるように、
+    # 起動ごとに 1 行（event: CONFIG）を書く。paper_report が区間として読む。
+    config_snapshot = build_config_snapshot(cfg)
+    signal_journal.record_config(config_snapshot, ts=clock.now())
+    log.info(
+        "Config snapshot: id={} components={} env={} rev={}".format(
+            config_snapshot["config_id"],
+            ",".join(config_snapshot["enabled_components"]) or "none",
+            config_snapshot["exchange_env"],
+            config_snapshot["code_revision"] or "unknown",
         )
+    )
 
     # --- M4: exchange-side STOP_LOSS (安全網) ---
     # The bot keeps its own close-based trailing logic; this manager only keeps
@@ -213,7 +293,118 @@ def main() -> None:
             symbol="*", kind="RATCHET_ALERT", ok=False, detail=message,
         )
 
-    stop_om = StopOrderManager(client, cfg, alert_fn=_on_stop_alert)
+    # Endpoint comes from config (exchange.env → base_url / testnet_base_url) with
+    # AIVC_EXCHANGE_ENV / BINANCE_BASE_URL as env overrides, so switching between
+    # prod / testnet / paper needs no code change.  In ``paper`` this factory
+    # never reads credentials and never builds a signed client.
+    stack = build_exchange_stack(cfg, alert_fn=_on_stop_alert)
+    client = stack.client
+    broker = stack.broker
+    stop_om = stack.stop_om
+    account = stack.account
+    base_url = stack.base_url
+    log.info(f"Exchange endpoint: {base_url} (env={stack.env})")
+    if stack.is_paper:
+        log.info(
+            "PAPER mode (実板ペーパー): 本番公開データ + 模擬約定 / "
+            "署名付き経路なし・資格情報不要"
+        )
+
+    book_recorder = OrderBookRecorder(client, cfg)
+
+    # --- G3: BTC 日足 SMA200 ゲート（起動時に取得、日次更新） ---
+    # 意味論は Step 2a 評価（strategy/gates.py）に準拠: 前日までの確定日足、
+    # 終値 < SMA のときだけ止める。
+    # **意図的な逸脱（裁定 2026-11-20）**: データ欠損・陳腐化は評価側の
+    # pass-through ではなく fail-closed。`data_unavailable` で新規エントリーを
+    # 止め、ジャーナル（GATE）と通知に残す（無言の凍結にしない）。
+    #
+    # 日足は G3 / W2 で共有する（銘柄ごとに UTC 1 日 1 回取得）。G3 は BTC だけ、
+    # W2 は運用銘柄ごとなので、同じ銘柄を二重に取りに行かせない。
+    daily_cache = DailyBarCache(client.fetch_klines)
+
+    def _on_g3_change(status: Any) -> None:
+        signal_journal.record_gate(status.as_dict(), ts=clock.now())
+        if not status.ok and status.blocked:
+            notifier.notify_error(
+                f"G3 data unavailable → new entries blocked: {status.reason}"
+            )
+        elif not status.ok:
+            notifier.notify_error(f"G3 cannot evaluate (gate open): {status.reason}")
+
+    g3 = G3Tracker(cfg, daily_cache.as_fetch(clock.now), on_change=_on_g3_change)
+    if g3.enabled:
+        log.info(
+            f"G3 enabled: {g3_config(cfg)['symbol']} daily close vs "
+            f"SMA{g3_config(cfg)['sma_period']} "
+            f"(fail_closed={g3.fail_closed}, live/shadow common)"
+        )
+    else:
+        log.info("G3 disabled (htf_gate.g3.enabled=false)")
+    g3.refresh(clock.now(), force=True)
+
+    # --- W2: 銘柄ごとのボラ連動間引き（Step 2b 暫定採用） ---
+    # rv30 が過去 365 本の p90 を **厳密に超える** 銘柄の新規エントリーだけを止める。
+    # ゲートの原則（裁定 2026-11-20）:
+    #   止めるのは「リスクの積極証拠（高ボラ）」か「データの破損（無し・列無し・
+    #   取得失敗・陳腐化・欠け）」のときだけ。証拠の不在（履歴不足）はリスクとして
+    #   扱わない＝既定は pass（評価実装と同じ）。whipsaw.w2.on_insufficient_history
+    #   を block にすると安全側（履歴不足でも止める）に切り替えられる。
+    #
+    # 対象は **運用銘柄＋シャドー銘柄**（``watched_symbols``）。シャドー
+    # （SOLJPY）も live と同じ条件で判定する必要があるため（2026-11-20 裁定:
+    # 再入場判定の標本を実運用と同一条件で生成する）。日足は G3 と共有の
+    # ``daily_cache`` を通るので、増える取得は SOLJPY の 1 日 1 回だけ。
+    def _on_w2_change(status: Any) -> None:
+        signal_journal.record_gate(status.as_dict(), ts=clock.now())
+        if status.state == STATE_DATA_ERROR:
+            notifier.notify_error(
+                f"W2 fail-closed ({status.symbol}): new entries stopped ({status.reason})"
+            )
+        elif status.state == STATE_INSUFFICIENT and status.blocked:
+            notifier.notify_error(
+                f"W2 insufficient history ({status.symbol}): new entries stopped "
+                f"({status.reason})"
+            )
+
+    w2 = W2Tracker(
+        cfg, daily_cache.as_fetch(clock.now), watched_symbols(cfg), on_change=_on_w2_change
+    )
+    if w2.enabled:
+        w2cfg = w2_config(cfg)
+        log.info(
+            f"W2 enabled: per-symbol rv{w2cfg['vol_window_days']} > "
+            f"p{int(round(w2cfg['percentile'] * 100))} of {w2cfg['ref_window_days']}d "
+            f"(insufficient_history={w2cfg['on_insufficient_history']}, "
+            f"data_error=block, symbols={','.join(w2.symbols)})"
+        )
+    else:
+        log.info("W2 disabled (whipsaw.w2.enabled=false)")
+    w2.refresh(clock.now(), force=True)
+    # gates.* はバックテスト専用（1h 足から日足を集計して判定列を付ける）。
+    # live は判定列を作らないため、有効なままだと gate_block_reason が
+    # 「列が無い＝fail-safe」で全銘柄を止める。事故防止に明示警告する。
+    if daily_gates_enabled(cfg):
+        log.warning(
+            "gates.* is enabled but live/shadow does not build daily gate columns; "
+            "all entries would be blocked. Use htf_gate.g3 for live instead."
+        )
+
+    # --- MS6 Step2: 運用対象外シンボルのシャドー観測 ---
+    shadow = ShadowObserver(cfg)
+    shadow_flag_path = (cfg.get("shadow", {}) or {}).get("flag_path")
+    shadow_flag_written = False
+    last_shadow_bar_ts = None
+    shadow_bar_idx = 0
+    if shadow_syms:
+        log.info(
+            f"Shadow observation: {', '.join(shadow_syms)} "
+            f"(no orders; journal={shadow.journal_path})"
+        )
+
+    # --- M4: exchange-side STOP_LOSS (安全網) ---
+    # ``stop_om`` は上の build_exchange_stack で構築済み: prod / testnet は
+    # 取引所 STOP、paper は模擬 STOP（価格監視＋模擬約定）。
 
     # --- Restore state ---
     state = state_mgr.load()
@@ -235,7 +426,7 @@ def main() -> None:
         pos = positions[sym]
         try:
             base = _base_asset(sym, quote_asset)
-            actual_qty = client.get_spot_balance(base)
+            actual_qty = account.get_spot_balance(base)
             if actual_qty < pos.qty * 0.95:
                 log.warning(
                     f"Position drift: expected {pos.qty} {base} ({sym}), "
@@ -539,6 +730,27 @@ def main() -> None:
                                         f"{sym}: stop rollback after failed partial TP failed"
                                     )
 
+                # --- 実板ペーパー: 模擬 STOP の価格監視（取引所 STOP の代替）---
+                # 板に常駐 STOP は置けないので、毎ループの現在値で到達判定する。
+                # 到達したらジャーナルに TRIGGERED（venue=paper_mock）を残し、
+                # 約定自体は下の通常の決済経路（模擬ブローカー＝実板）で行う。
+                stop_trigger = None
+                if stack.is_paper:
+                    stop_trigger = stop_om.poll_trigger(sym, current_close, ts=now)
+                    if stop_trigger is not None:
+                        signal_journal.record_stop(
+                            symbol=sym, kind="TRIGGERED", ok=True, ts=now,
+                            step="monitor", stop_price=stop_trigger["stop_price"],
+                            qty=stop_trigger["qty"],
+                            order_id=stop_trigger["order_id"],
+                            detail=(
+                                f"price {current_close} <= stop "
+                                f"{stop_trigger['stop_price']} (simulated stop)"
+                            ),
+                            # 実 STOP と機械的に区別できるようにする（venue と併記）。
+                            extra={"stop_kind": "PAPER_MOCK"},
+                        )
+
                 # Check exit
                 exit_reason = pm.check_exit(
                     position, current_close, current_atr, regime, now,
@@ -546,6 +758,9 @@ def main() -> None:
                     current_adx=current_adx,
                     trend_ma=trend_ma_val,
                 )
+                if stop_trigger is not None:
+                    # 模擬 STOP 到達は常に STOP_LOSS として扱う（決済理由の整合）。
+                    exit_reason = ExitReason.STOP_LOSS
                 if exit_reason is None:
                     continue
 
@@ -570,7 +785,19 @@ def main() -> None:
                     price=exit_price, ts=now, kind="EXIT",
                     fee=exit_order.fee, fee_asset=exit_order.fee_asset,
                     order_id=exit_order.order_id,
-                    extra={"reason": exit_reason.value, "pnl": round(pnl, 4)},
+                    extra={
+                        "reason": exit_reason.value,
+                        "pnl": round(pnl, 4),
+                        **(
+                            {
+                                "stop_kind": "PAPER_MOCK",
+                                "stop_price": stop_trigger["stop_price"],
+                                "trigger_price": stop_trigger["trigger_price"],
+                            }
+                            if stop_trigger is not None
+                            else {}
+                        ),
+                    },
                 )
                 # M4: 決済が約定してから安全網の stop を取り消す。キャンセル失敗は
                 # 握りつぶさずエラーとして表面化させ、孤児 stop として次ループで
@@ -596,7 +823,7 @@ def main() -> None:
 
                 # Equity snapshot + circuit breaker (best effort, post-fill)
                 try:
-                    quote_balance = client.get_account_balance(quote_asset)
+                    quote_balance = account.get_account_balance(quote_asset)
                     state.equity_snapshots.append(
                         {"ts": now.isoformat(), "equity": quote_balance}
                     )
@@ -644,12 +871,24 @@ def main() -> None:
             # 実発注はしない。シグナル→決済を仮想で追い、journal に積む。
             at_boundary = _is_1h_boundary(now)
             if at_boundary:
+                # G3 は日次（UTC 0:00 以降の最初のループ）で更新。shadow と
+                # 実エントリーが同じバーで同じ判定を使うよう、両者の前に置く。
+                g3.refresh(now)
+                w2.refresh(now)  # 同上（日足は daily_cache で G3 と共有）
                 bar_ts = _ts_floor_1h(now)
                 if bar_ts != last_shadow_bar_ts:
                     last_shadow_bar_ts = bar_ts
                     shadow_bar_idx += 1
                     try:
-                        events = shadow.on_bar(now, feat_1h, shadow_bar_idx)
+                        events = shadow.on_bar(
+                            now,
+                            feat_1h,
+                            shadow_bar_idx,
+                            htf_gate=g3.status if g3.enabled else None,
+                            # W2 も live と同じ判定・設定をそのまま渡す（銘柄ごと）。
+                            # 止めた候補はシャドーのジャーナルに GATE として残る。
+                            vol_gate=w2.statuses if w2.enabled else None,
+                        )
                         if events:
                             log.info(f"Shadow events this bar: {len(events)}")
                         if not shadow_flag_written and shadow.enabled:
@@ -672,6 +911,8 @@ def main() -> None:
                     feat_1h, feat_5m, cfg, now,
                     current_positions=list(positions.values()),
                     cooldowns=cooldowns,
+                    htf_gate=g3.status if g3.enabled else None,
+                    vol_gate=w2.statuses if w2.enabled else None,
                 )
                 # MS6 Step3: シグナル時点の板を記録し、シグナルと紐づけて残す。
                 # 実際に発注できたか（entries_blocked / 枠 / 残高）に関わらず記録する
@@ -691,7 +932,7 @@ def main() -> None:
                 equity = 0.0
                 if signals:
                     try:
-                        equity = client.get_account_balance(quote_asset)
+                        equity = account.get_account_balance(quote_asset)
                     except Exception as e:
                         log.error(f"Balance fetch failed – skipping entries: {e}")
                         notifier.notify_error(f"Balance fetch failed: {e}")

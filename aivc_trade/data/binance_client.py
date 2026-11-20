@@ -121,6 +121,27 @@ def format_float(value: float) -> str:
     return text or "0"
 
 
+def parse_klines(raw: List[list]) -> pd.DataFrame:
+    """Parse a raw ``/api/v3/klines`` payload into an OHLCV frame.
+
+    公開データだけを扱う純関数。認証を持たないクライアント
+    (:mod:`aivc_trade.data.public_client`) からも同じ実装を使う。
+    """
+    rows = []
+    for k in raw:
+        rows.append(
+            {
+                "ts": datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 class BinanceClient:
     """Thin wrapper around Binance public + authenticated REST endpoints."""
 
@@ -651,16 +672,4 @@ class BinanceClient:
 
     @staticmethod
     def _parse_klines(raw: List[list]) -> pd.DataFrame:
-        rows = []
-        for k in raw:
-            rows.append(
-                {
-                    "ts": datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc),
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5]),
-                }
-            )
-        return pd.DataFrame(rows)
+        return parse_klines(raw)
