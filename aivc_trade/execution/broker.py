@@ -41,8 +41,21 @@ class LiveBroker:
                 total_qty = sum(float(f["qty"]) for f in fills)
                 total_cost = sum(float(f["qty"]) * float(f["price"]) for f in fills)
                 order.filled_price = total_cost / total_qty if total_qty > 0 else order.price
+                order.filled_qty = total_qty
+                order.quote_qty = total_cost
+                # 実コスト検証（ペーパー評価指標）用に手数料を拾う。テストネットの
+                # MARKET 応答は fills[].commission を返すが、無い場合もあるので
+                # 合計0で握りつぶす（記録側で「不明」と区別できるよう fee_asset は空）。
+                order.fee = sum(float(f.get("commission") or 0.0) for f in fills)
+                assets = {str(f.get("commissionAsset") or "") for f in fills}
+                assets.discard("")
+                order.fee_asset = assets.pop() if len(assets) == 1 else ""
             else:
                 order.filled_price = float(resp.get("price", order.price or 0))
+                executed = float(resp.get("executedQty") or 0.0)
+                if executed > 0:
+                    order.filled_qty = executed
+                    order.quote_qty = float(resp.get("cummulativeQuoteQty") or 0.0)
 
             log.info(
                 f"Order filled: {order.symbol} {order.side.value} "

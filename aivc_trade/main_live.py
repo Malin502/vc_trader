@@ -8,6 +8,7 @@ and persists state for restart recovery.
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import time
 import traceback
@@ -50,7 +51,8 @@ from aivc_trade.ops.signal_journal import SignalJournal
 log = get_logger("main_live")
 
 # Monitoring interval (seconds) – 5min bars
-LOOP_INTERVAL = 300  # 5 minutes
+# AIVC_LOOP_INTERVAL で短縮できる（Testnet の通し確認 / systemd の起動直後検証用）。
+LOOP_INTERVAL = float(os.environ.get("AIVC_LOOP_INTERVAL", "300") or 300)
 
 _REGIME_EXIT_REASONS = frozenset({
     ExitReason.REGIME_EXIT,
@@ -59,6 +61,32 @@ _REGIME_EXIT_REASONS = frozenset({
     ExitReason.REGIME_EXIT_RANGE_RUNNER,
     ExitReason.REGIME_EXIT_RANGE_RUNNER_TIMEOUT,
 })
+
+#: systemd / docker stop は SIGTERM を送る。既定動作ではプロセスが即死して
+#: 建玉状態が保存されないため、フラグに落としてループの切れ目で抜ける。
+_SHUTDOWN = {"requested": False}
+
+
+def _request_shutdown(signum: int, _frame: Any) -> None:
+    log.warning(f"Received signal {signum} – shutting down after this iteration")
+    _SHUTDOWN["requested"] = True
+
+
+def _install_signal_handlers() -> None:
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _request_shutdown)
+        except (ValueError, OSError) as e:  # メインスレッド以外では設定不可
+            log.debug(f"Could not install handler for {sig}: {e}")
+
+
+def _sleep_interruptible(seconds: float) -> None:
+    """Sleep *seconds*, returning early when a shutdown signal arrived."""
+    remaining = max(0.0, float(seconds))
+    while remaining > 0 and not _SHUTDOWN["requested"]:
+        step = min(1.0, remaining)
+        time.sleep(step)
+        remaining -= step
 
 
 def _ts_floor_1h(dt: datetime) -> datetime:
@@ -87,6 +115,23 @@ def _base_asset(symbol: str, quote_asset: str) -> str:
     return symbol
 
 
+def _signal_bar_ts(df: Any) -> Optional[datetime]:
+    """1h 足の時刻（シグナル判定に使った最後の確定足）を返す。
+
+    バックテストのシグナルと (symbol, bar_ts) で突き合わせるための識別子。
+    取れない場合は None（レポート側はその行を一致率の分母から外す）。
+    """
+    try:
+        if df is None or len(df) == 0:
+            return None
+        ts = df["ts"].iloc[-1]
+        if hasattr(ts, "to_pydatetime"):
+            ts = ts.to_pydatetime()
+        return ts if isinstance(ts, datetime) else None
+    except Exception:
+        return None
+
+
 def _resize_exchange_stop(
     stop_om: StopOrderManager, position: Position, qty: float, step: float
 ) -> bool:
@@ -102,6 +147,7 @@ def _resize_exchange_stop(
 
 def main() -> None:
     setup_logger()
+    _install_signal_handlers()
     cfg = load_config()
 
     log.info("=" * 50)
@@ -158,7 +204,16 @@ def main() -> None:
     # The bot keeps its own close-based trailing logic; this manager only keeps
     # a resting SELL stop on the exchange for the same position, so a crash or
     # network outage cannot leave the position unprotected.
-    stop_om = StopOrderManager(client, cfg)
+    #
+    # ラチェット (cancelReplace) が連続で失敗したときは、ログに埋もれないよう
+    # 既存の通知経路（Discord）へ明示的に上げる + ジャーナルにも残す。
+    def _on_stop_alert(message: str) -> None:
+        notifier.notify_error(message)
+        signal_journal.record_stop(
+            symbol="*", kind="RATCHET_ALERT", ok=False, detail=message,
+        )
+
+    stop_om = StopOrderManager(client, cfg, alert_fn=_on_stop_alert)
 
     # --- Restore state ---
     state = state_mgr.load()
@@ -246,9 +301,11 @@ def main() -> None:
         sym: float(lot_info.get(sym, {}).get("stepSize", 0.0) or 0.0) for sym in symbols
     }
     reconcile_ok = False
+    reconcile_detail = ""
     try:
         report = stop_om.reconcile(positions, steps=steps)
         reconcile_ok = report.listed
+        reconcile_detail = report.summary()
         log.info(f"Exchange stop reconciliation: {report.summary()}")
         for line in report.details():
             log.warning(f"Exchange stop reconciliation: {line}")
@@ -257,9 +314,17 @@ def main() -> None:
         if report.has_errors:
             _block_entries(f"startup stop reconciliation failed: {report.summary()}")
     except Exception as e:
+        reconcile_detail = f"crashed: {e}"
         log.error(f"Startup stop reconciliation crashed: {e}")
         notifier.notify_error(f"Startup stop reconciliation failed: {e}")
         _block_entries(f"startup stop reconciliation failed: {e}")
+    signal_journal.record_stop(
+        symbol="*",
+        kind="RECONCILED",
+        ok=reconcile_ok,
+        step="startup",
+        detail=reconcile_detail,
+    )
 
     log.info("Entering main loop")
 
@@ -269,13 +334,20 @@ def main() -> None:
     while True:
         try:
             now = clock.now()
+            if _SHUTDOWN["requested"]:
+                log.info("Shutdown requested – persisting state and exiting")
+                state.positions = list(positions.values())
+                state.cooldowns = dict(cooldowns)
+                state.last_process_ts = now
+                state_mgr.save(state)
+                break
             blocked_this_iteration = False
             hc.heartbeat(now)
 
             # --- Circuit breaker ---
             if cb.is_halted(now):
                 log.info(f"Halted until {cb.halt_until}")
-                time.sleep(LOOP_INTERVAL)
+                _sleep_interruptible(LOOP_INTERVAL)
                 continue
 
             # --- Fetch latest candles (incremental) ---
@@ -369,9 +441,21 @@ def main() -> None:
                             f"{current_close:.2f}"
                         )
                     else:
+                        before = stop_om.get_state(sym)
                         stop_state = stop_om.update_stop(position, level)
                         if stop_state is None or not stop_state.is_open:
                             _block_entries(f"{sym}: exchange stop update failed")
+                            signal_journal.record_stop(
+                                symbol=sym, kind="RATCHET", ok=False, step="trail",
+                                stop_price=level, qty=position.qty,
+                                detail=f"consecutive={stop_om.ratchet_failures(sym)}",
+                            )
+                        elif before is None or float(before.stop_price) != float(stop_state.stop_price):
+                            signal_journal.record_stop(
+                                symbol=sym, kind="RATCHET", ok=True, step="trail",
+                                stop_price=stop_state.stop_price, qty=stop_state.qty,
+                                order_id=stop_state.order_id,
+                            )
 
                 # --- Check partial TP (live) ---
                 if (
@@ -408,6 +492,10 @@ def main() -> None:
                             # 数量が建玉を上回り、トリガ時に売りが拒否されて無防備に
                             # なる。縮小に失敗したら部分利確そのものを見送る。
                             _block_entries(f"{sym}: stop resize before partial TP failed")
+                            signal_journal.record_stop(
+                                symbol=sym, kind="RESIZE", ok=False, step="partial_tp",
+                                qty=remaining_qty, detail="resize before partial TP failed",
+                            )
                         else:
                             partial_order = om.create_exit_order(sym, partial_qty, now)
                             try:
@@ -430,6 +518,13 @@ def main() -> None:
                                 notifier.notify_partial_tp(
                                     sym, partial_qty, partial_price, partial_pnl,
                                     position.qty,
+                                )
+                                signal_journal.record_fill(
+                                    symbol=sym, side="SELL", qty=partial_qty,
+                                    price=partial_price, ts=now, kind="PARTIAL",
+                                    fee=partial_order.fee,
+                                    fee_asset=partial_order.fee_asset,
+                                    order_id=partial_order.order_id,
                                 )
 
                             except Exception as e:
@@ -469,13 +564,30 @@ def main() -> None:
                 notifier.notify_exit(
                     sym, position.qty, exit_price, exit_reason.value, pnl
                 )
+                signal_journal.record_fill(
+                    symbol=sym, side="SELL",
+                    qty=exit_order.filled_qty or position.qty,
+                    price=exit_price, ts=now, kind="EXIT",
+                    fee=exit_order.fee, fee_asset=exit_order.fee_asset,
+                    order_id=exit_order.order_id,
+                    extra={"reason": exit_reason.value, "pnl": round(pnl, 4)},
+                )
                 # M4: 決済が約定してから安全網の stop を取り消す。キャンセル失敗は
                 # 握りつぶさずエラーとして表面化させ、孤児 stop として次ループで
                 # 再試行する（残ると次の建玉を誤って売り得るためエントリも止める）。
-                if stop_om.enabled and not stop_om.cancel(sym):
-                    log.error(f"Orphan stop cleanup failed for {sym} after exit")
-                    notifier.notify_error(f"Stop cancel failed after exit: {sym}")
-                    _block_entries(f"{sym}: stop cancel after exit failed")
+                if stop_om.enabled:
+                    if not stop_om.cancel(sym):
+                        log.error(f"Orphan stop cleanup failed for {sym} after exit")
+                        notifier.notify_error(f"Stop cancel failed after exit: {sym}")
+                        _block_entries(f"{sym}: stop cancel after exit failed")
+                        signal_journal.record_stop(
+                            symbol=sym, kind="CANCELLED", ok=False, step="after_exit",
+                            detail="stop cancel failed (orphan retried next loop)",
+                        )
+                    else:
+                        signal_journal.record_stop(
+                            symbol=sym, kind="CANCELLED", ok=True, step="after_exit",
+                        )
                 cooldown_hours = _get_cooldown_hours(exit_reason, cfg)
                 cooldowns[sym] = pm.compute_cooldown(now, cooldown_hours)
                 # Drop the slot as soon as the sell is filled so a failure in the
@@ -564,12 +676,15 @@ def main() -> None:
                 # MS6 Step3: シグナル時点の板を記録し、シグナルと紐づけて残す。
                 # 実際に発注できたか（entries_blocked / 枠 / 残高）に関わらず記録する
                 # ので、後日「取れなかったシグナルの板」も含めて検証できる。
+                sig_ids: Dict[str, str] = {}
                 for sig in signals:
-                    signal_journal.record(
+                    rec = signal_journal.record(
                         sig,
                         ts=now,
+                        bar_ts=_signal_bar_ts(feat_1h.get(sig.symbol)),
                         orderbook=book_recorder.snapshot(sig.symbol, now),
                     )
+                    sig_ids[sig.symbol] = str(rec.get("signal_id") or "")
                 if entries_blocked is not None:
                     log.warning(f"Entries skipped this loop: {entries_blocked}")
                     signals = []
@@ -608,6 +723,19 @@ def main() -> None:
                         filled_price = entry_order.filled_price or best.entry_price
                         atr_at_entry = float(feat_1h[best.symbol].iloc[-1]["atr"])
 
+                        # 想定（シグナル時点の entry_price）との乖離と実手数料を残す。
+                        # これが「約定乖離」「実コスト」の元データになる。
+                        signal_journal.record_fill(
+                            symbol=best.symbol, side="BUY",
+                            qty=entry_order.filled_qty or qty,
+                            price=filled_price, ts=now, kind="ENTRY",
+                            signal_id=sig_ids.get(best.symbol),
+                            expected_price=best.entry_price,
+                            fee=entry_order.fee,
+                            fee_asset=entry_order.fee_asset,
+                            order_id=entry_order.order_id,
+                        )
+
                         position = Position(
                             symbol=best.symbol,
                             qty=qty,
@@ -641,6 +769,17 @@ def main() -> None:
                                 _block_entries(
                                     f"{best.symbol}: initial stop placement failed"
                                 )
+                                signal_journal.record_stop(
+                                    symbol=best.symbol, kind="PLACED", ok=False,
+                                    step="initial", stop_price=level, qty=qty,
+                                    detail="initial stop placement failed",
+                                )
+                            else:
+                                signal_journal.record_stop(
+                                    symbol=best.symbol, kind="PLACED", ok=True,
+                                    step="initial", stop_price=placed.stop_price,
+                                    qty=placed.qty, order_id=placed.order_id,
+                                )
 
                         notifier.notify_entry(
                             best.symbol, qty, filled_price, position.stop_price
@@ -670,10 +809,10 @@ def main() -> None:
         except Exception as e:
             log.error(f"Unhandled error in main loop: {e}\n{traceback.format_exc()}")
             notifier.notify_error(f"Unhandled error: {e}")
-            time.sleep(30)
+            _sleep_interruptible(30)
             continue
 
-        time.sleep(LOOP_INTERVAL)
+        _sleep_interruptible(LOOP_INTERVAL)
 
 
 if __name__ == "__main__":

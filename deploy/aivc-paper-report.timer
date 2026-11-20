@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the AIVC paper metrics report daily (09:00 JST)
+
+[Timer]
+# UTC 00:00 = JST 09:00
+OnCalendar=*-*-* 00:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
