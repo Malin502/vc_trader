@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
@@ -166,9 +167,13 @@ class PaperStopManager:
         模擬 STOP はプロセス内にしか無いので、再起動後は建玉の ``stop_price``
         （bot 側のトレール位置）から安全網を復元する。復元できない建玉は
         ``errors`` に残し、``main_live`` が新規エントリーを止める。
+
+        ``positions`` は ``main_live`` / :class:`StopOrderManager` と同じ
+        ``{symbol: Position}`` のマッピングを受ける（リストも可）。
         """
         report = PaperReconcileReport()
-        for pos in list(positions or []):
+        held = positions.values() if isinstance(positions, Mapping) else (positions or [])
+        for pos in list(held):
             symbol = getattr(pos, "symbol", None)
             if not symbol:
                 continue

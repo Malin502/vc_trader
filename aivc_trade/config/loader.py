@@ -29,6 +29,13 @@ STOP_ORDER_TYPES = ("STOP_LOSS", "STOP_LOSS_LIMIT")
 _CLIENT_ORDER_PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]{1,20}$")
 
 
+def _resolve_env(cfg: Dict[str, Any], override: str | None = None) -> str:
+    """Effective ``exchange.env`` (``AIVC_EXCHANGE_ENV`` wins over config)."""
+    exchange = cfg.get("exchange", {}) or {}
+    raw = override or exchange.get("env") or "prod"
+    return str(raw).strip().lower()
+
+
 def load_config(path: str | Path | None = None) -> Dict[str, Any]:
     """Load config YAML and overlay environment variable overrides."""
     if path is not None:
@@ -41,10 +48,18 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
 
     # --- Environment variable overrides ---
     _env = os.environ.get
-    if _env("BINANCE_API_KEY"):
-        cfg.setdefault("secrets", {})["api_key"] = _env("BINANCE_API_KEY", "")
-    if _env("BINANCE_API_SECRET"):
-        cfg.setdefault("secrets", {})["api_secret"] = _env("BINANCE_API_SECRET", "")
+    # 実板ペーパー（``exchange.env: paper``）は署名付きエンドポイントへの経路を
+    # 持たないため、資格情報は **読まない**（環境変数が残っていても cfg に載せない）。
+    # これが「paper モードでは API キーを読まない」の実装上の担保になる。
+    _effective_env = _resolve_env(cfg, _env("AIVC_EXCHANGE_ENV"))
+    if _effective_env != "paper":
+        if _env("BINANCE_API_KEY"):
+            cfg.setdefault("secrets", {})["api_key"] = _env("BINANCE_API_KEY", "")
+        if _env("BINANCE_API_SECRET"):
+            cfg.setdefault("secrets", {})["api_secret"] = _env("BINANCE_API_SECRET", "")
+    else:
+        # config.yaml に secrets が書かれていても paper では持ち込まない。
+        cfg.pop("secrets", None)
     if _env("DISCORD_WEBHOOK_URL"):
         cfg["notification"]["discord_webhook_url"] = _env("DISCORD_WEBHOOK_URL", "")
     if _env("AIVC_INITIAL_EQUITY"):

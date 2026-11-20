@@ -673,6 +673,8 @@ def main() -> None:
                                 f"price {current_close} <= stop "
                                 f"{stop_trigger['stop_price']} (simulated stop)"
                             ),
+                            # 実 STOP と機械的に区別できるようにする（venue と併記）。
+                            extra={"stop_kind": "PAPER_MOCK"},
                         )
 
                 # Check exit

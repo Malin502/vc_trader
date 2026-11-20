@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 import aivc_trade.data.public_client as public_client_mod
 import aivc_trade.main_live as main_live
@@ -156,6 +157,53 @@ class TestPaperSafetyGuard:
         assert isinstance(stack.broker, main_live.LiveBroker)
         assert isinstance(stack.stop_om, main_live.StopOrderManager)
 
+    # -- 資格情報そのものを読まない（cfg に載らない）--------------------
+    def _secret_cfg(self, tmp_path, env):
+        cfg = load_config(CONFIG)
+        cfg["exchange"]["env"] = env
+        cfg["secrets"] = {"api_key": "FROM-FILE", "api_secret": "FROM-FILE"}
+        cfg["persistence"].update(
+            {
+                "state_file": str(tmp_path / "state.json"),
+                "candles_dir": str(tmp_path / "candles"),
+                "signal_journal_path": str(tmp_path / "journal.jsonl"),
+            }
+        )
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.safe_dump(cfg, allow_unicode=True), encoding="utf-8")
+        return path
+
+    def test_paper_load_config_drops_credentials(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BINANCE_API_KEY", "SHOULD-NOT-BE-READ")
+        monkeypatch.setenv("BINANCE_API_SECRET", "SHOULD-NOT-BE-READ")
+        path = self._secret_cfg(tmp_path, "paper")
+
+        cfg = load_config(path)
+
+        # 環境変数も config.yaml の secrets も、paper では cfg に載らない。
+        assert "secrets" not in cfg
+        assert is_paper_env(cfg) is True
+
+    def test_env_override_to_paper_also_drops_credentials(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BINANCE_API_KEY", "SHOULD-NOT-BE-READ")
+        monkeypatch.setenv("AIVC_EXCHANGE_ENV", "paper")
+        path = self._secret_cfg(tmp_path, "prod")
+
+        cfg = load_config(path)
+
+        assert cfg["exchange"]["env"] == "paper"
+        assert "secrets" not in cfg
+
+    def test_testnet_load_config_still_reads_credentials(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("BINANCE_API_KEY", "testnet-key")
+        monkeypatch.setenv("BINANCE_API_SECRET", "testnet-secret")
+        path = self._secret_cfg(tmp_path, "testnet")
+
+        cfg = load_config(path)
+
+        assert cfg["secrets"]["api_key"] == "testnet-key"
+        assert cfg["secrets"]["api_secret"] == "testnet-secret"
+
 
 # ----------------------------------------------------------------------
 # simulated fills against the real book
@@ -252,6 +300,26 @@ class TestPaperBroker:
         assert restored.get_spot_balance("BTC") == pytest.approx(base)
         assert restored.fills == 1
 
+    def test_realized_pnl_tracks_round_trip(self, tmp_path):
+        client = FakePublicClient({"bids": [[990.0, 5.0]], "asks": [[1000.0, 5.0]]})
+        cfg = _paper_cfg(tmp_path)
+        broker = PaperBroker(client, cfg)
+        broker.execute(
+            Order(symbol="BTCJPY", side=Side.BUY, order_type=OrderType.MARKET, qty=1.0)
+        )
+        assert broker.realized_pnl == pytest.approx(0.0)
+
+        # 取得単価 1000 → 990 で決済: 1.0 * (990 - 1000) = -10
+        client.depth = {"bids": [[990.0, 5.0]], "asks": [[1000.0, 5.0]]}
+        broker.execute(
+            Order(symbol="BTCJPY", side=Side.SELL, order_type=OrderType.MARKET, qty=1.0)
+        )
+        assert broker.realized_pnl == pytest.approx(-10.0)
+
+        restored = PaperBroker(client, cfg)
+        assert restored.realized_pnl == pytest.approx(-10.0)
+        assert restored.cost_basis == {}
+
 
 # ----------------------------------------------------------------------
 # simulated stop
@@ -310,6 +378,23 @@ class TestPaperStop:
         assert report.has_errors is False
         assert report.placed == ["BTCJPY"]
         assert restored.is_protected("BTCJPY")
+
+    def test_reconcile_accepts_mapping_like_main_live(self, tmp_path):
+        """main_live / StopOrderManager と同じ ``{symbol: Position}`` を受ける."""
+        cfg = _paper_cfg(tmp_path)
+        pos = self._position()
+        restored = PaperStopManager(cfg)
+
+        report = restored.reconcile({"BTCJPY": pos})  # リストではなくマッピング
+
+        assert report.positions == 1
+        assert report.placed == ["BTCJPY"]
+        assert restored.is_protected("BTCJPY")
+        # 復元値は安全網（bot 側 stop の少し下）であること
+        buffer_pct = float(cfg["stop_order"]["safety_buffer_pct"])
+        assert restored.get_state("BTCJPY").stop_price == pytest.approx(
+            950.0 * (1 - buffer_pct / 100)
+        )
 
     def test_reconcile_reports_unbuildable_position(self, tmp_path):
         stop = PaperStopManager(_paper_cfg(tmp_path))
@@ -465,3 +550,140 @@ class TestPaperLoopEntry:
         account = json.loads(Path(cfg["paper"]["account_file"]).read_text(encoding="utf-8"))
         assert account["quote_balance"] < 100_000.0
         assert account["base_balances"]["BTC"] > 0
+
+    def test_simulated_stop_closes_position_and_is_marked(self, monkeypatch, tmp_path):
+        """模擬 STOP 到達 → 模擬約定で決済 → ジャーナルに実 STOP と区別できる形で残る."""
+        from datetime import datetime, timezone
+
+        import pandas as pd
+
+        from aivc_trade.core.types import Position, Regime, SystemState
+        from aivc_trade.ops.persistence import StateManager
+
+        now = datetime(2026, 11, 20, 3, 1, tzinfo=timezone.utc)
+        price = 5_000_000.0
+        stop = price * 0.98
+
+        cfg = _paper_cfg(tmp_path)
+        cfg["exchange"]["symbols"] = ["BTCJPY"]
+        cfg["exchange"]["shadow_symbols"] = []
+        cfg["shadow"]["enabled"] = False
+        cfg["notification"]["discord_webhook_url"] = ""
+        monkeypatch.setattr(main_live, "load_config", lambda: cfg)
+
+        # 建玉を state に仕込む → 起動時 reconcile が模擬 STOP を復元する。
+        # 模擬口座側にも同じ建玉を持たせる（起動時の照合は口座を正とする）。
+        Path(cfg["paper"]["account_file"]).parent.mkdir(parents=True, exist_ok=True)
+        Path(cfg["paper"]["account_file"]).write_text(
+            json.dumps(
+                {
+                    "quote_asset": "JPY",
+                    "quote_balance": 95_000.0,
+                    "base_balances": {"BTC": 0.001},
+                    "realized_pnl": 0.0,
+                    "cost_basis": {"BTC": price},
+                    "fills": 1,
+                }
+            ),
+            encoding="utf-8",
+        )
+        StateManager(cfg["persistence"]["state_file"]).save(
+            SystemState(
+                positions=[
+                    Position(
+                        symbol="BTCJPY",
+                        qty=0.001,
+                        entry_price=price,
+                        stop_price=stop,
+                        initial_qty=0.001,
+                        entry_ts=now,
+                        atr_at_entry=price * 0.01,
+                        highest_price=price,
+                        lowest_price=price,
+                    )
+                ]
+            )
+        )
+
+        class FakePublic:
+            def __init__(self, base_url, **kwargs):
+                self.base_url = base_url
+
+            def fetch_klines(self, symbol, interval="1h", limit=250):
+                df = pd.DataFrame(
+                    [{
+                        "ts": now,
+                        "open": price,
+                        "high": price,
+                        "low": price,
+                        "close": price,
+                        "volume": 1.0,
+                    }]
+                )
+                df.attrs["symbol"] = symbol
+                return df
+
+            def get_ticker_price(self, symbol):
+                return price * 0.97  # stop (0.98) を下抜けている
+
+            def get_lot_size(self, symbol):
+                return {"minQty": 1e-05, "maxQty": 1e6, "stepSize": 1e-05, "minNotional": 0.0}
+
+            def fetch_order_book(self, symbol, limit=100):
+                return {
+                    "lastUpdateId": 2,
+                    "bids": [[str(price * 0.969), "1.0"], [str(price * 0.965), "5.0"]],
+                    "asks": [[str(price * 0.971), "1.0"], [str(price * 0.975), "5.0"]],
+                }
+
+        def fake_features(df, cfg):
+            symbol = df.attrs["symbol"]
+            return pd.DataFrame(
+                [{
+                    "ts": now,
+                    "close": price,
+                    "atr": price * 0.01,
+                    "atrp": 0.012,
+                    "adx": 35.0,
+                    "trend_ma": price * 1.05,
+                    "high": price,
+                    "low": price,
+                    "ema_slow": price * 1.05,
+                    "regime": Regime.RANGE,
+                    "symbol": symbol,
+                }]
+            )
+
+        monkeypatch.setattr(main_live, "PublicMarketClient", FakePublic)
+        monkeypatch.setattr(main_live, "compute_features_1h", fake_features)
+        monkeypatch.setattr(main_live, "compute_features_5m", fake_features)
+        monkeypatch.setattr(main_live, "classify_regime", lambda row, cfg: Regime.RANGE)
+        monkeypatch.setattr(main_live, "generate_signals", lambda *a, **kw: [])
+        monkeypatch.setattr(main_live.clock, "now", lambda: now)
+        monkeypatch.setattr(
+            main_live,
+            "_sleep_interruptible",
+            lambda _s: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+
+        with pytest.raises(KeyboardInterrupt):
+            main_live.main()
+
+        journal = Path(cfg["persistence"]["signal_journal_path"])
+        rows = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
+
+        triggered = [r for r in rows if r.get("event") == "STOP" and r.get("kind") == "TRIGGERED"]
+        assert triggered, "simulated stop did not fire"
+        assert triggered[0]["stop_kind"] == "PAPER_MOCK"
+        assert triggered[0]["venue"] == "paper_mock"
+        buffer_pct = float(cfg["stop_order"]["safety_buffer_pct"])
+        assert triggered[0]["stop_price"] == pytest.approx(stop * (1 - buffer_pct / 100))
+
+        exits = [r for r in rows if r.get("event") == "FILL" and r.get("kind") == "EXIT"]
+        assert exits, "stop did not close the position"
+        assert exits[0]["reason"] == "STOP_LOSS"
+        assert exits[0]["stop_kind"] == "PAPER_MOCK"
+        # 実板の bid で約定している（ticker そのままではない）
+        assert exits[0]["price"] == pytest.approx(price * 0.969)
+
+        assert StateManager(cfg["persistence"]["state_file"]).load().positions == []

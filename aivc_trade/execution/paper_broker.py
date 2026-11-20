@@ -68,6 +68,8 @@ class PaperBroker:
         self.quote_balance = self.initial_equity
         self.base_balances: Dict[str, float] = {}
         self.realized_pnl = 0.0
+        #: base 資産ごとの平均取得単価（実現損益の算出用）。
+        self.cost_basis: Dict[str, float] = {}
         self.fills = 0
         self.last_fill: Optional[Dict[str, Any]] = None
         self._load()
@@ -124,12 +126,25 @@ class PaperBroker:
 
         if side == "BUY":
             self.quote_balance -= notional + fee
-            self.base_balances[base] = self.base_balances.get(base, 0.0) + filled
+            held = self.base_balances.get(base, 0.0)
+            new_qty = held + filled
+            if new_qty > 0:
+                # 加重平均の取得単価（実現損益の基準）。
+                prev_cost = self.cost_basis.get(base, 0.0)
+                self.cost_basis[base] = (held * prev_cost + filled * price) / new_qty
+            self.base_balances[base] = new_qty
         else:
             self.quote_balance += notional - fee
+            prev_cost = self.cost_basis.get(base, 0.0)
+            if prev_cost > 0:
+                # 手数料は quote_balance 側で既に引かれているので、ここでは
+                # 価格差だけを実現損益として積む。
+                self.realized_pnl += (price - prev_cost) * filled
             remaining = self.base_balances.get(base, 0.0) - filled
             # 浮動小数の残骸を残さない（0 近傍は 0 とみなす）。
             self.base_balances[base] = remaining if remaining > 1e-12 else 0.0
+            if self.base_balances[base] == 0.0:
+                self.cost_basis.pop(base, None)
 
         order.filled_price = price
         order.filled_qty = filled
@@ -200,6 +215,9 @@ class PaperBroker:
             str(k).upper(): float(v) for k, v in (data.get("base_balances") or {}).items()
         }
         self.realized_pnl = float(data.get("realized_pnl", 0.0))
+        self.cost_basis = {
+            str(k).upper(): float(v) for k, v in (data.get("cost_basis") or {}).items()
+        }
         self.fills = int(data.get("fills", 0))
         log.info(
             f"PAPER account restored: {self.quote_balance:.2f} {self.quote_asset}, "
@@ -216,6 +234,7 @@ class PaperBroker:
                         "quote_balance": self.quote_balance,
                         "base_balances": self.base_balances,
                         "realized_pnl": self.realized_pnl,
+                        "cost_basis": self.cost_basis,
                         "fills": self.fills,
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     },

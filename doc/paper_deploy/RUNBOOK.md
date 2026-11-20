@@ -107,6 +107,10 @@ sudo systemctl stop aivc-paper             # 停止（SIGTERM）
 - `SIGTERM` は「今のイテレーションを終えて状態を保存してから抜ける」経路に載せて
   ある（`TimeoutStopSec=90`）。`SIGKILL` は使わない（状態が古いまま残る）
 - 再起動は `systemctl restart`。起動時に必ず模擬 STOP の復元（reconcile）が走る
+  （建玉の `stop_price` から安全網を作り直す。復元できなければ新規エントリを止める）
+- 復元時の正は **模擬口座**（`data/paper/paper_account.json`）。state と口座の建玉が
+  食い違うと `Position drift` を出して建玉をリセットする（口座ファイルだけ消すと
+  建玉が失われるので、消すときは state も一緒に消す）
 - `Restart=on-failure`。異常終了は 30 秒後に自動復帰する
 
 ---
@@ -184,6 +188,7 @@ journalctl -u aivc-paper-report --since today
 3. `fills.slippage_bps.worst` が S1 想定（既定 5bps）内か
 4. ジャーナルの全行に `venue: paper_mock` が付いていること（実約定が混ざっていないこと）
 5. `data/paper/paper_account.json` の `quote_balance` が想定どおり減っているか
+   （`realized_pnl` は取得単価ベースの実現損益。手数料は `quote_balance` 側で引かれる）
 
 ---
 
