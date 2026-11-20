@@ -49,6 +49,7 @@ from aivc_trade.execution.paper_broker import PaperBroker
 from aivc_trade.execution.paper_stop import PaperStopManager
 from aivc_trade.execution.stop_order_manager import StopOrderManager
 from aivc_trade.execution.broker import LiveBroker
+from aivc_trade.ops.config_snapshot import build_config_snapshot
 from aivc_trade.ops.healthcheck import HealthCheck
 from aivc_trade.ops.notifier import DiscordNotifier
 from aivc_trade.ops.persistence import StateManager
@@ -258,6 +259,20 @@ def main() -> None:
         defaults={"venue": "paper_mock", "execution": "simulated"} if paper else None,
     )
 
+    # --- 起動時の構成をジャーナルに残す（期間ごとの構成の再構成用） ---
+    # 「その期間に有効だった構成（G3 のみ / G3＋W2 等）」を後から言えるように、
+    # 起動ごとに 1 行（event: CONFIG）を書く。paper_report が区間として読む。
+    config_snapshot = build_config_snapshot(cfg)
+    signal_journal.record_config(config_snapshot, ts=clock.now())
+    log.info(
+        "Config snapshot: id={} components={} env={} rev={}".format(
+            config_snapshot["config_id"],
+            ",".join(config_snapshot["enabled_components"]) or "none",
+            config_snapshot["exchange_env"],
+            config_snapshot["code_revision"] or "unknown",
+        )
+    )
+
     # --- M4: exchange-side STOP_LOSS (安全網) ---
     # The bot keeps its own close-based trailing logic; this manager only keeps
     # a resting SELL stop on the exchange for the same position, so a crash or
@@ -292,17 +307,25 @@ def main() -> None:
 
     # --- G3: BTC 日足 SMA200 ゲート（起動時に取得、日次更新） ---
     # 意味論は Step 2a 評価（strategy/gates.py）に準拠: 前日までの確定日足、
-    # 終値 < SMA のときだけ止める。データ不備は「判定不能＝ゲートは開く」。
+    # 終値 < SMA のときだけ止める。
+    # **意図的な逸脱（裁定 2026-11-20）**: データ欠損・陳腐化は評価側の
+    # pass-through ではなく fail-closed。`data_unavailable` で新規エントリーを
+    # 止め、ジャーナル（GATE）と通知に残す（無言の凍結にしない）。
     def _on_g3_change(status: Any) -> None:
         signal_journal.record_gate(status.as_dict(), ts=clock.now())
-        if not status.ok:
-            notifier.notify_error(f"G3 cannot evaluate (gate stays open): {status.reason}")
+        if not status.ok and status.blocked:
+            notifier.notify_error(
+                f"G3 data unavailable → new entries blocked: {status.reason}"
+            )
+        elif not status.ok:
+            notifier.notify_error(f"G3 cannot evaluate (gate open): {status.reason}")
 
     g3 = G3Tracker(cfg, client.fetch_klines, on_change=_on_g3_change)
     if g3.enabled:
         log.info(
             f"G3 enabled: {g3_config(cfg)['symbol']} daily close vs "
-            f"SMA{g3_config(cfg)['sma_period']} (live/shadow common)"
+            f"SMA{g3_config(cfg)['sma_period']} "
+            f"(fail_closed={g3.fail_closed}, live/shadow common)"
         )
     else:
         log.info("G3 disabled (htf_gate.g3.enabled=false)")

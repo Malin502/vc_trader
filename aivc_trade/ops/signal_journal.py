@@ -44,6 +44,7 @@ EVENT_SIGNAL = "SIGNAL"
 EVENT_FILL = "FILL"
 EVENT_STOP = "STOP"
 EVENT_GATE = "GATE"
+EVENT_CONFIG = "CONFIG"
 
 
 def _iso(ts: datetime) -> str:
@@ -230,7 +231,11 @@ class SignalJournal:
         ts: Optional[datetime] = None,
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Record a G3 state change. ``ok=False`` は「判定不能（ゲートは開く）」。"""
+        """Record a G3 state change. ``ok=False`` は「判定不能」。
+
+        live の fail-closed では ``ok=False`` かつ ``blocked=True``
+        （``reason`` が ``data_unavailable: ...``）になり、新規エントリーは止まる。
+        """
         record: Dict[str, Any] = {
             "event": EVENT_GATE,
             "ts": _iso(ts or datetime.now(timezone.utc)),
@@ -238,6 +243,32 @@ class SignalJournal:
             "level": "INFO" if status.get("ok") else "WARNING",
         }
         record.update(status)
+        self._stamp(record, extra)
+        self.append(record)
+        return record
+
+    # ------------------------------------------------------------------
+    # CONFIG (起動時の構成スナップショット = 期間ごとの構成の再構成用)
+    # ------------------------------------------------------------------
+    def record_config(
+        self,
+        snapshot: Dict[str, Any],
+        *,
+        ts: Optional[datetime] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record the configuration a run started with (``event: CONFIG``).
+
+        有効なゲート（G3 のみ / G3+W2 等）と版を起動ごとに 1 行残す。ジャーナル
+        上の隣接する CONFIG レコードの区間が、その構成で走っていた期間になる。
+        """
+        record: Dict[str, Any] = {
+            "event": EVENT_CONFIG,
+            "ts": _iso(ts or datetime.now(timezone.utc)),
+            "mode": self.mode,
+            "level": "INFO",
+        }
+        record.update(snapshot)
         self._stamp(record, extra)
         self.append(record)
         return record

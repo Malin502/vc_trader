@@ -91,31 +91,69 @@ def test_generate_signals_returns_nothing_when_blocked():
 # --------------------------------------------------------------------------
 # G3Tracker（取得・日次更新・再試行）
 # --------------------------------------------------------------------------
-def test_tracker_fetch_failure_keeps_gate_open_and_recovers():
+def test_tracker_fetch_failure_blocks_and_recovers():
     calls, events = [], []
     state = {"fail": True}
+    latest = {"end": datetime(2026, 11, 20, tzinfo=timezone.utc)}
 
     def fetch(sym, interval, limit):
         calls.append((sym, interval, limit))
         if state["fail"]:
             raise RuntimeError("boom")
-        return daily([100.0] * 199 + [101.0])
+        return daily([100.0] * 199 + [101.0], end_day=latest["end"])
 
     t = G3Tracker(CFG, fetch, on_change=events.append)
     t.refresh(NOW, force=True)
-    # 取得失敗は「判定不能＝ゲートは開く」（ブロックしない）
-    assert not t.status.blocked and not t.status.ok and len(events) == 1
+    # live の既定は fail-closed: 取得失敗＝data_unavailable で新規エントリー停止
+    assert t.status.blocked and not t.status.ok and len(events) == 1
+    assert t.status.reason.startswith("data_unavailable")
     t.refresh(NOW + timedelta(minutes=1))          # 再試行間隔前: 呼ばない
     assert len(calls) == 1
     t.refresh(NOW + timedelta(minutes=11))         # 再試行（まだ失敗、状態不変＝記録増えず）
     assert len(calls) == 2 and len(events) == 1
+    assert t.status.blocked and not t.status.ok
     state["fail"] = False
     t.refresh(NOW + timedelta(minutes=22))
     assert t.status.ok and not t.status.blocked and len(events) == 2
     t.refresh(NOW + timedelta(hours=3))            # 同日は再取得しない
     assert len(calls) == 3
+    latest["end"] = datetime(2026, 11, 21, tzinfo=timezone.utc)  # 前日分が届いた
     t.refresh(NOW + timedelta(days=1))             # 翌日 UTC に更新
-    assert len(calls) == 4 and t.status.ok
+    assert len(calls) == 4 and t.status.ok and not t.status.blocked
+
+
+def test_tracker_fail_open_option_matches_evaluation_semantics():
+    # 評価側と同じ pass-through に戻す比較用スイッチ（通常運用では使わない）。
+    def fetch(sym, interval, limit):
+        raise RuntimeError("boom")
+
+    t = G3Tracker(CFG, fetch, fail_closed=False)
+    t.refresh(NOW, force=True)
+    assert not t.status.blocked and not t.status.ok
+
+
+def test_tracker_stale_daily_blocks_on_live_path():
+    # 陳腐化（確定日足が前日より古い）も live では止める。古い判定で開けない。
+    stale = daily([100.0] * 199 + [101.0], end_day=datetime(2026, 11, 18, tzinfo=timezone.utc))
+    events = []
+    t = G3Tracker(CFG, lambda *a: stale, on_change=events.append)
+    t.refresh(NOW, force=True)
+    assert t.status.blocked and not t.status.ok
+    assert t.status.reason.startswith("data_unavailable") and "stale" in t.status.reason
+    assert len(events) == 1
+
+    # 同じデータでも fail_closed=False なら評価側と同じく古い日足で判定する。
+    t_open = G3Tracker(CFG, lambda *a: stale, fail_closed=False)
+    t_open.refresh(NOW, force=True)
+    assert t_open.status.ok and not t_open.status.blocked
+
+
+def test_tracker_blocks_before_first_fetch_on_live_path():
+    # 未取得の間も「判定できない」＝止まる（起動直後の窓を開けない）。
+    t = G3Tracker(CFG, lambda *a: None)
+    assert t.status.blocked and not t.status.ok
+    t_open = G3Tracker(CFG, lambda *a: None, fail_closed=False)
+    assert not t_open.status.blocked and not t_open.status.ok
 
 
 def test_tracker_disabled_makes_no_fetch():

@@ -12,9 +12,13 @@ G3: BTC の日足終値が日足 SMA200 を **下回っている間**は、全�
 * 終値 == SMA は「下回っていない」ので止めない（厳密に ``<`` のときだけ止める）。
 * 判定に使うのは **現在の UTC 日より前の、最後に確定した日足**だけ。当日の足は
   使わない（評価側 ``_previous_daily_index`` の ``side="left"`` と同じ）。
-* データが無い / 確定足が期間に満たない / 終値・SMA が NaN のときは
-  **ゲートしない**（評価側 ``_comparison_state`` と同じ pass-through）。
-  ``ok=False`` で「判定できなかった」ことだけを記録し、呼び出し側が警告を出す。
+* データが無い / 確定足が期間に満たない / 終値・SMA が NaN のとき、評価側は
+  **ゲートしない**（``_comparison_state`` の pass-through）。live はここから
+  **意図的に逸脱**し、``fail_closed``（既定 true）で **新規エントリーを止める**
+  （``data_unavailable``）。バックテストには欠損が無いため評価数値には影響せず、
+  実運用では「データが壊れたら黙って開かない」を優先する（M4a と同じ設計）。
+  ``ok=False`` で「判定できなかった」ことを保持し、ジャーナル（``level=WARNING``）
+  と通知に残す。陳腐化（確定日足が前日より古い）も同じ扱い。
 
 評価側と違うのは**データ源だけ**（評価: 1h parquet の集計 / live: 1d 足の直接
 取得）。200 日分の日足を 1h 足から集計すると 1 回の取得上限（1000 本 ≒ 41 日）に
@@ -24,7 +28,7 @@ G3: BTC の日足終値が日足 SMA200 を **下回っている間**は、全�
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import numpy as np
@@ -40,6 +44,8 @@ DEFAULT_PERIOD = 200
 FETCH_LIMIT = 250
 #: 判定できなかったときの再試行間隔（秒）
 RETRY_SECONDS = 600
+#: データ欠損・陳腐化で blocked したときの reason 接頭辞（live の fail-closed）。
+DATA_UNAVAILABLE_PREFIX = "data_unavailable"
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,10 @@ def g3_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "enabled": bool(g.get("enabled", False)),
         "symbol": str(g.get("symbol", DEFAULT_SYMBOL)),
         "sma_period": int(g.get("sma_period", DEFAULT_PERIOD)),
+        # live は欠損・陳腐化したら止まる（fail-closed）。評価側の pass-through
+        # からの**意図的な逸脱**。既定 True（安全側）。False は評価と同じ
+        # 意味論に戻す比較用のスイッチで、通常運用では使わない。
+        "fail_closed": bool(g.get("fail_closed", True)),
     }
 
 
@@ -138,26 +148,89 @@ def evaluate_g3(
     return GateStatus(True, blocked, True, reason, symbol, close, sma, last_ts)
 
 
+def expected_closed_bar_date(now: datetime) -> date:
+    """判定に使えるべき最新の確定日足の日付（= 前日 UTC）。"""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return (now.astimezone(timezone.utc) - timedelta(days=1)).date()
+
+
+def apply_fail_closed(status: GateStatus, now: datetime) -> GateStatus:
+    """live 経路の欠損・陳腐化を ``blocked``（``data_unavailable``）に変換する。
+
+    **評価側との意図的な逸脱**: 評価（``strategy/gates.py`` / ``evaluate_g3``）は
+    データ不備を pass-through（ゲートは開く）するが、live のリスクゲートは
+    「データが壊れたら黙って開かず止まる」を原則にする（M4a の
+    「失敗時は新規エントリーを止める」と同じ設計）。バックテストには欠損が
+    無いため、この分岐は評価数値に影響しない。
+
+    * 判定不能（取得失敗・期間不足・NaN） → blocked
+    * 確定日足が前日より古い（陳腐化）   → blocked（古い判定で開けない）
+    * ゲート無効・正常判定               → そのまま
+
+    ``ok`` は False のまま（「判定できなかった」ことを保持し、ジャーナルでは
+    ``level=WARNING``、呼び出し側では通知になる）。
+    """
+    if not status.enabled:
+        return status
+    if not status.ok:
+        reason = str(status.reason).replace(" (gate open)", "")
+    else:
+        expected = expected_closed_bar_date(now)
+        if status.bar_ts is None or status.bar_ts.date() >= expected:
+            return status
+        reason = (
+            f"stale daily data: last closed bar {status.bar_ts.date()} "
+            f"< expected {expected}"
+        )
+    return GateStatus(
+        True,
+        True,
+        False,
+        f"{DATA_UNAVAILABLE_PREFIX}: {reason}",
+        symbol=status.symbol,
+        close=status.close,
+        sma=status.sma,
+        bar_ts=status.bar_ts,
+    )
+
+
 class G3Tracker:
     """起動時に取得し、日次（UTC 0:00 以降の最初のループ）で更新する。
 
     ``fetch`` は ``(symbol, interval, limit) -> DataFrame``（例:
-    ``client.fetch_klines``）。取得に失敗したら「判定不能＝ゲートは開く」に
-    落とし、``RETRY_SECONDS`` ごとに再試行する。状態が変わった時だけ
-    ``on_change`` を呼ぶ（ジャーナル・通知用）。
+    ``client.fetch_klines``）。取得できたかの判定は ``evaluate_g3`` に任せ、
+    ``fail_closed``（既定 True）なら欠損・陳腐化を **blocked** に倒す
+    （:func:`apply_fail_closed` 参照）。``RETRY_SECONDS`` ごとに再試行する。
+    状態が変わった時だけ ``on_change`` を呼ぶ（ジャーナル・通知用）。
     """
 
-    def __init__(self, cfg: Dict[str, Any], fetch, on_change=None):
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        fetch,
+        on_change=None,
+        *,
+        fail_closed: Optional[bool] = None,
+    ):
         self.cfg = cfg
         self._fetch = fetch
         self._on_change = on_change
-        self.status: GateStatus = (
-            _not_evaluable(g3_config(cfg)["symbol"], "not yet fetched (gate open)")
-            if g3_enabled(cfg)
-            else GateStatus(False, False, True, "disabled")
-        )
+        g = g3_config(cfg)
+        self.fail_closed = g["fail_closed"] if fail_closed is None else bool(fail_closed)
+        if not g["enabled"]:
+            self.status: GateStatus = GateStatus(False, False, True, "disabled")
+        else:
+            # 未取得の間も「判定できない」＝止まる（fail-closed の既定）。
+            initial = _not_evaluable(g["symbol"], "not yet fetched")
+            self.status = (
+                apply_fail_closed(initial, datetime.now(timezone.utc))
+                if self.fail_closed
+                else initial
+            )
         self._last_ok_day = None
         self._last_try: Optional[datetime] = None
+        self._announced = False
 
     @property
     def enabled(self) -> bool:
@@ -177,28 +250,37 @@ class G3Tracker:
         try:
             daily = self._fetch(g["symbol"], "1d", FETCH_LIMIT)
             new = evaluate_g3(daily, self.cfg, now)
-        except Exception as e:  # ネットワーク等。評価側と同じくゲートは開く
+        except Exception as e:  # ネットワーク等。live では data_unavailable として止める
             new = _not_evaluable(g["symbol"], f"daily fetch error: {e}")
+        if self.fail_closed:
+            new = apply_fail_closed(new, now)
         if new.ok:
             self._last_ok_day = today
-        self._set(new)
+        self._set(new, now)
         return self.status
 
-    def _set(self, new: GateStatus) -> None:
+    def _set(self, new: GateStatus, now: Optional[datetime] = None) -> None:
         old = self.status
         self.status = new
-        changed = (old.blocked, old.ok) != (new.blocked, new.ok) or old.reason == "not yet fetched (gate open)"
-        if not new.ok:
+        changed = (
+            not self._announced
+            or (old.blocked, old.ok) != (new.blocked, new.ok)
+        )
+        self._announced = True
+        if not new.ok and new.blocked:
+            log.warning(f"G3 data unavailable; new entries blocked ({new.reason})")
+        elif not new.ok:
             log.warning(f"G3 cannot evaluate; gate stays open ({new.reason})")
         elif new.blocked:
             log.info(f"G3 blocking new entries: {new.reason}")
         else:
             log.info(f"G3 open: {new.reason}")
+        now = now or datetime.now(timezone.utc)
         if new.ok and new.bar_ts is not None:
-            expected = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+            expected = expected_closed_bar_date(now)
             if new.bar_ts.date() < expected:
-                # 評価側は「前日までの最後の確定日足」を使うので、欠損があれば
-                # 古い日足で判定する（止めも開けもしない）。可視化だけしておく。
+                # fail_closed=False（評価と同じ意味論）のときだけここに来る。
+                # 古い日足で判定していることを可視化する（止めも開けもしない）。
                 log.warning(
                     f"G3 daily data is stale: last closed bar {new.bar_ts.date()} "
                     f"(expected {expected})"

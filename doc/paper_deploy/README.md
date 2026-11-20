@@ -20,7 +20,7 @@ Testnet 版（`aivc-trade.service` / `.env.testnet` / `preflight_reconcile.py`�
 
 | ファイル | 置き場所（例） | 用途 |
 |---|---|---|
-| `config.paper.yaml` | `/opt/aivc_trade/config.paper.yaml` | paper 用 config（下記の差分だけ変える） |
+| `config.paper.yaml` | `/opt/aivc_trade/config.paper.yaml` | paper 用 config（リポジトリ直下に版管理。そのまま使う） |
 | `.env.paper` | `/opt/aivc_trade/.env.paper` | 通知先だけ（任意・600・git 管理外） |
 | `deploy/aivc-paper.service` | `/etc/systemd/system/` | 本体（常駐） |
 | `deploy/aivc-paper-report.service` / `.timer` | `/etc/systemd/system/` | 日次レポート |
@@ -28,25 +28,21 @@ Testnet 版（`aivc-trade.service` / `.env.testnet` / `preflight_reconcile.py`�
 | `paper_report.py` | リポジトリ直下 | 日次集計（評価指標） |
 | `paper_loop_check.py` | リポジトリ直下 | 有限回の通し確認（`--env paper`） |
 
-`config.paper.yaml` は `aivc_trade/config/config.yaml` をコピーして、次の点だけ
-変える（他は main と同一に保つ。変えたら差分を記録する）:
+`config.paper.yaml` は `aivc_trade/config/config.yaml` をコピーし、次の **2 点だけ**
+変えたものをリポジトリ直下に置いている（他は main と同一。ドリフトは
+`tests/test_g3_activation.py` が検出する）:
 
 ```yaml
 exchange:
-  env: paper                        # ← これがモードスイッチ（本番公開データ + 模擬約定）
-  symbols: [BTCJPY, ETHJPY, XRPJPY] # 運用対象（実発注はしない）
-  shadow_symbols: [SOLJPY]          # シャドー観測は継続
-notification:
-  discord_webhook_url: ""           # 実値は DISCORD_WEBHOOK_URL で渡す
-persistence:
-  state_file: data/position_state.json          # VM 上の絶対パスでもよい
-  candles_dir: data/candles
-  signal_journal_path: data/signals/signal_journal.jsonl
-paper:
-  initial_equity: 100000.0          # 模擬口座の初期資金（JPY）
-  fallback_slippage_bps: 5.0        # 板が取れないときの片道スリッページ
-  account_file: data/paper/paper_account.json
+  env: paper                        # ← モードスイッチ（本番公開データ + 模擬約定）
+htf_gate:
+  g3:
+    enabled: true                   # G3（BTC 日足 < SMA200 → 新規停止）を有効化
+    fail_closed: true               # 欠損・陳腐化は data_unavailable で新規停止
 ```
+
+`persistence` / `paper` / `notification` は main と同じ値。VM 上で絶対パスに変える
+場合は差分を記録する。意図的な逸脱（fail-closed）の理由は `RUNBOOK.md` §10。
 
 ## 手順（要約）
 

@@ -220,14 +220,22 @@ gates:
 
 # ---------- 高時間軸ゲート G3（live / shadow 用） ----------
 # Step 2a 評価と同じ意味論（UTC 日次・終値のみ・厳密に < で停止・
-# 前日までの確定日足のみ・データ不備はゲートを開く）。
+# 前日までの確定日足のみ）。
 # ライブの参照銘柄は BTCJPY で確定（評価の USDT 側は BTCUSDT だが、実戦データで統一）。
-# 既定は無効＝現行挙動。実板ペーパーで有効化するときは config.paper.yaml で true にする。
+# 既定は無効＝現行挙動。実板ペーパーは config.paper.yaml で有効化する。
+#
+# fail_closed は**評価側からの意図的な逸脱**（裁定 2026-11-20）:
+#   評価はデータ欠損を pass-through（ゲートを開く）するが、live（paper 含む）は
+#   欠損・陳腐化したら `data_unavailable` で新規エントリーを止める。
+#   バックテストには欠損が無いため評価数値には影響しない。実運用では
+#   「データが壊れたら黙って開かない」を優先する（M4a と同じ設計）。
+#   止めた事実は journal の GATE（level=WARNING）と Discord 通知に残る。
 htf_gate:
   g3:
     enabled: false
     symbol: BTCJPY
     sma_period: 200
+    fail_closed: true       # 既定 true。false は評価と同じ意味論（比較用・通常運用では使わない）
 
 # ---------- Whipsaw 対策 W1〜W3（Step 2b / 事前登録 2026-11-20 追補） ----------
 # 2021 型（タイミングの誤り）への手当て。既定は全て無効＝現行挙動。

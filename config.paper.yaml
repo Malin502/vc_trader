@@ -1,0 +1,356 @@
+# 実板ペーパー用 config（exchange.env: paper）
+#
+# 運用上の正はこのファイル。`aivc_trade/config/config.yaml` をコピーし、
+# 次の 2 点だけを変えている（他は main と同一に保つ。差分はテストで固定）:
+#
+#   exchange.env: paper     … 本番公開データ + 模擬約定（API キーを読まない）
+#   htf_gate.g3.enabled: true … G3（BTC 日足終値 < SMA200 で新規停止）を有効化
+#
+# 配置先（Nyao VM）: /opt/aivc_trade/config.paper.yaml
+# 手順は doc/paper_deploy/RUNBOOK.md、意図的な逸脱（fail-closed）の説明もそこ。
+#
+# ============================================================
+# AIVC Trade - Trend-Focused Configuration
+# ============================================================
+
+exchange:
+  name: binance
+  # prod | testnet | paper
+  #   paper = 実板ペーパー: 本番の公開データ（認証不要）+ 実際の板での模擬約定。
+  #           API キーを読まず、署名付き経路を作らない（Testnet の置き換え）。
+  env: paper            # ← 実板ペーパー（本番公開データ + 模擬約定）
+  # prod 用 API ホスト。Binance Japan の公式サービスはグローバル基盤
+  # (binance.com/ja) 上にあり、API も api.binance.com が正。
+  # （binance.co.jp はお名前.com の駐車ドメインで、api.binance.co.jp は
+  #   実在しないホストだったため M2 の空欄をここで確定した）
+  base_url: "https://api.binance.com"
+  testnet_base_url: "https://testnet.binance.vision"
+  quote_asset: JPY            # 建て通貨（残高取得・base asset 判定に使用）
+  # 運用対象（MS6 で 1枠化・SOL 除外。仕様 v2 §8）
+  symbols:
+    - BTCJPY
+    - ETHJPY
+    - XRPJPY
+  # 運用対象外だがデータ取得・シグナル計算を継続する銘柄（MS6 Step2 のシャドー観測用）。
+  # シグナルが出ても実注文は出さず、ops/shadow.py が仮想トレードとして記録する。
+  shadow_symbols:
+    - SOLJPY
+  market_type: spot          # 現物のみ
+
+timeframes:
+  signal: 1h                 # シグナル生成足
+  execution: 5m              # 執行フィルタ足
+  monitor: 5m                # ストップ更新監視足
+
+position:
+  max_concurrent: 1          # 同時保有最大数（MS6: 2枠→1枠。M5 §6.1 の 1枠優位を採用）
+  max_per_symbol: 1          # 同一銘柄の同時保有上限
+  cooldown_hours: 24         # 決済後の再エントリ禁止(h) ※後方互換用
+  stop_loss_cooldown_hours: 48
+  regime_exit_cooldown_hours: 24
+
+costs:
+  commission_bps: 10         # 片道手数料 (bps)  = 0.10%
+  slippage_bps: 5            # 片道スリッページ (bps) = 0.05%
+  roundtrip_cost_bps: 30     # 往復合計 (bps) = 0.30%
+
+# ---------- 1h Indicator Parameters ----------
+indicators_1h:
+  ema_fast_period: 20
+  ema_slow_period: 50
+  ema_slope_lookback: 8      # slope 計算用 lookback (bars)
+  adx_period: 14
+  atr_period: 14
+  atrp_z_window: 200         # atrp z-score rolling window
+  donchian_period: 20
+  volume_sma_period: 20
+  swing_low_period: 10       # recent_swing_low 用
+
+# ---------- 5m Indicator Parameters ----------
+indicators_5m:
+  ema_fast_period: 20
+  ema_slow_period: 50
+  atr_period: 14
+  spread_proxy_window: 20
+  micro_vol_percentile_window: 200
+  micro_vol_percentile_q: 90 # percentile threshold
+
+# ---------- Regime Thresholds ----------
+regime:
+  # CHAOS判定
+  chaos_atrp_z: 2.0
+  chaos_adx_trend_down: 25
+  chaos_drop_multiplier: 3.0
+  chaos_drop_lookback: 15     # 15h
+  chaos_atr_pct: 2.5          # ATR% >= 2.5% → CHAOS
+  chaos_ret_1h_pct: 1.8       # |ret_1h| >= 1.8% → CHAOS
+  # TREND_UP判定
+  trend_slope_min: 0.0015
+  trend_adx_min: 20            # ADX >= 20 (was 18)
+  trend_atrp_z_min: -0.5
+  # RANGE判定
+  adx_range_max: 15            # ADX < 15 → RANGE
+  # ヒステリシス
+  regime_confirm_bars: 3       # regime切替に連続3本必要
+
+# ---------- Entry Conditions ----------
+entry:
+  # full       : 現行（レジーム + ret24h/entry_filter/ブレイク/出来高/品質）
+  # regime_only: 比較用の簡素版（TREND_UP 判定のみ。決済・サイジング・
+  #              クールダウンは full と同一）
+  mode: full
+  ret24h_min_pct: 2.0          # 直近24hリターン条件を緩和（攻撃寄り）
+  atr_pct_min: 1.0             # 旧ゲート（後方互換）
+  cooldown_bars: 24            # 決済後のクールダウン (bars, 24h)
+  trigger: breakout            # pullback | breakout | both
+  pullback_threshold: 0.015    # |close - ema_fast|/close <= 1.5%
+  volume_above_sma: true
+
+entry_filter:
+  enabled: true
+  adx_min: 22
+  trend_ma_type: ema
+  trend_ma_period: 200
+  atr_pct_min: 0.25            # 0.25%未満の低ボラは除外
+
+entry_signal:
+  breakout:
+    enabled: true
+    lookback_bars: 48
+    buffer_pct: 0.10
+
+entry_quality:
+  enabled: true
+  min_adx: 25
+  adx_strict_gt: true
+  min_atrp: 0.006
+  min_atrp_z: -0.2
+  min_volume_ratio: 1.00
+  min_slope: 0.0015
+
+# ---------- Risk Management ----------
+risk:
+  sl_atr_k: 2.0               # 旧キー（後方互換）
+  stop_structure_buffer: 0.3   # max(ATR stop, swing_low - 0.3*ATR)
+  be_activate_pct: 1.5         # 旧キー（後方互換）
+  fee_buffer_bps: 8            # BE移動時の手数料バッファ
+  # MaxDD の運用線（仕様 v2。モンテカルロ裏付けは別タスク）
+  #   review_line_pct : ここに達したら停止レビュー（新規エントリ停止の判断材料）
+  #   safe_line_pct   : 安全線。ここに達したら運用停止
+  # equity ピークからのドローダウン率（正の値で表す）で比較する。
+  max_drawdown:
+    review_line_pct: 0.15
+    safe_line_pct: 0.20
+  initial_sl:
+    enabled: true
+    sl_atr_k: 2.0
+    min_sl_pct: 0.6
+    max_sl_pct: 2.5
+  early_fail_exit:
+    enabled: true
+    window_bars: 6
+    min_mfe_pct: 0.25
+    max_mae_pct: 0.60
+    require_bad_regime: false
+    bad_regimes: ["RANGE", "CHAOS", "OFF"]
+  breakeven:
+    enabled: true
+    activate_mfe_pct: 0.8
+    buffer_pct: 0.05
+
+# ---------- Exit Conditions ----------
+exit:
+  trail_start_atr: 1.0         # 含み益 >= 1.0*atr で追随開始
+  trail_start_mfe_pct: 2.0     # MFE >= 2.0% になるまで追随開始しない
+  trail_atr_multiplier: 2.5    # 通常トレール ATR乗数
+  trail_min_holding_hours: 2
+  trail_min_atrp: 0.004
+
+# ---------- Partial Take-Profit / Runner Mode ----------
+partial_tp:
+  enabled: true
+  threshold_pct: 4.2           # 早利確を抑えてランナー化を優先
+  ratio: 0.20                  # 利確割合を下げて伸ばす
+  max_count: 1                 # 最大1回
+
+runner:
+  trail_atr_k: 3.8             # ランナーをやや緩く保持
+  trail_activate_mfe_pct: 4.5  # ランナートレール有効化MFE閾値 (%)
+  trail_start_mfe_pct: 2.0     # 旧キー（後方互換）
+  stop_buffer_pct: 0.0         # stopノイズバッファ (%)
+  range_exit_confirm_bars: 10  # RANGE連続N本 + 条件でExit (was 3/6)
+  max_off_bars: 18             # 非TREND_UP最大猶予バー数
+  min_mfe_to_hold_pct: 1.5     # 保持継続の最小MFE (%)
+  chaos_tighten_k: 1.5         # CHAOS時のstopタイト化 ATR乗数
+  chaos_emergency_tp_pct: 5.0  # CHAOS時の緊急部分利確MFE閾値 (%)
+
+# ---------- Exit Tuning ----------
+exit_tuning:
+  strong_trend_hold:
+    enabled: true
+    adx_min: 30
+    disable_range_exit: true
+    disable_partial_tp: true
+    partial_tp_threshold_add_pct: 0.0
+    trail_atr_k_multiplier: 1.2
+  trail_two_stage:
+    enabled: true
+    mfe_switch_pct: 6.0
+    atr_k_before: 3.5
+    atr_k_after: 2.7
+    apply_to_runner: true
+    apply_to_core: true
+
+# ---------- Position Sizing ----------
+# 仕様 v2（MS6 改訂）: ライブもペーパーも 1% に統一する。
+# 従来 paper 2% は max_notional_pct=0.5 が常に先に効き、実効 1.18% で動いていた
+# （M5 §6.2）。値を揃えて「見かけのリスク」と「実効リスク」の乖離を消す。
+sizing:
+  risk_mode: paper           # paper | live
+  risk_per_trade_paper: 0.01 # 口座資産の 1%（ライブと同一値）
+  risk_per_trade_live: 0.01  # 口座資産の 1%（実弾初期）
+  max_notional_pct: 0.50     # 1枠あたり投下比率ガード
+
+# ---------- Higher-timeframe entry gates (Step 2a) ----------
+# 事前登録 gate-preregistration-2026-11-20.md の候補 G1〜G3。
+# 既定は全て無効＝現行挙動。日足は 1h 足から集計し、参照するのは
+# 「エントリー時刻の日付より前の、最後に確定した日足」（当日終値は使わない）。
+# sma_fast/slow は 50/200 に固定（閾値探索は禁止）。
+# ※ このセクションはバックテスト専用（simulator が判定列を付ける）。
+#    live / shadow は下の htf_gate.g3 を使う。
+gates:
+  sma_fast_period: 50
+  sma_slow_period: 200
+  g1:
+    enabled: false          # 銘柄の日足終値 < 日足 SMA200 → その銘柄は新規エントリーしない
+  g2:
+    enabled: false          # 銘柄の日足 SMA50 < 日足 SMA200 → その銘柄は新規エントリーしない
+  g3:
+    enabled: false          # 参照銘柄（BTC）の日足終値 < SMA200 → 全銘柄で新規エントリーしない
+    reference: BTC
+
+# ---------- 高時間軸ゲート G3（live / shadow 用） ----------
+# Step 2a 評価と同じ意味論（UTC 日次・終値のみ・厳密に < で停止・
+# 前日までの確定日足のみ）。
+# ライブの参照銘柄は BTCJPY で確定（評価の USDT 側は BTCUSDT だが、実戦データで統一）。
+# 既定は無効＝現行挙動。実板ペーパーは config.paper.yaml で有効化する。
+#
+# fail_closed は**評価側からの意図的な逸脱**（裁定 2026-11-20）:
+#   評価はデータ欠損を pass-through（ゲートを開く）するが、live（paper 含む）は
+#   欠損・陳腐化したら `data_unavailable` で新規エントリーを止める。
+#   バックテストには欠損が無いため評価数値には影響しない。実運用では
+#   「データが壊れたら黙って開かない」を優先する（M4a と同じ設計）。
+#   止めた事実は journal の GATE（level=WARNING）と Discord 通知に残る。
+htf_gate:
+  g3:
+    enabled: true           # 実板ペーパーで G3 を有効化（裁定 2026-11-20）
+    symbol: BTCJPY
+    sma_period: 200
+    fail_closed: true       # 既定 true。false は評価と同じ意味論（比較用・通常運用では使わない）
+
+# ---------- Whipsaw 対策 W1〜W3（Step 2b / 事前登録 2026-11-20 追補） ----------
+# 2021 型（タイミングの誤り）への手当て。既定は全て無効＝現行挙動。
+# 指標は日足リターンの 30 日標準偏差と、その過去 1 年（365 日）分位点。
+# 参照するのは「エントリー日の前日までの確定日足」だけ（先読みなし）。
+# パーセンタイル分布が未確定（履歴不足）の期間はゲートしない。
+whipsaw:
+  w1:
+    enabled: false          # ボラ連動サイズ: rv30 > 過去1年 80%tile → リスク半減
+    vol_window_days: 30
+    ref_window_days: 365
+    percentile: 0.80
+    risk_scale: 0.5         # 高ボラ期間のリスク倍率（1 トレードのリスクを半分）
+  w2:
+    enabled: false          # ボラ連動の間引き: rv30 > 過去1年 90%tile → 新規エントリーしない
+    vol_window_days: 30
+    ref_window_days: 365
+    percentile: 0.90
+  w3:
+    enabled: false          # ストップ連敗ブレーキ（全銘柄共通）
+    stop_window_days: 14    # この期間内の STOP_LOSS 件数を見る
+    stop_count: 3           # 3 件に達したら
+    halt_days: 7            # 7 日間、新規エントリーを停止
+
+# ---------- Symbol Score Weights ----------
+score:
+  w_slope: 0.6
+  w_adx: 0.4
+  w_atrp_z: -0.3
+
+# ---------- Order ----------
+order:
+  type: MARKET               # MARKET / LIMIT
+  max_entry_slippage_bps: 15
+
+# ---------- Exchange-side Stop Orders (M2 基盤・main_live へは未結線) ----------
+stop_order:
+  enabled: true
+  order_type: STOP_LOSS      # STOP_LOSS | STOP_LOSS_LIMIT
+  client_order_prefix: aivc-sl
+  limit_offset_pct: 0.10     # STOP_LOSS_LIMIT 時の指値オフセット（stop から下, %）
+  # 取引所側 stop を bot の stop より何%下に置くか（安全網のクッション）。
+  # bot の手仕舞いは終値ベースなので、同じ価格に置くとザラ場のタッチで取引所側が
+  # 先に約定し、bot 側の制御が効かなくなる。0 で完全一致（＝挙動が変わる）。
+  safety_buffer_pct: 0.3
+  # ラチェット (cancelReplace) の連続失敗がこの回数に達したら Discord に明示通知
+  # （M4b 持ち越し）。1回の失敗は復旧処理で吸収されるため、繰り返す場合だけ上げる。
+  ratchet_alert_after: 3
+
+# ---------- Circuit Breaker ----------
+circuit_breaker:
+  daily_loss_pct: 0.15       # -15% / 24h → 24h停止
+  daily_halt_hours: 24
+  weekly_loss_pct: 0.25      # -25% / 7d  → 48h停止
+  weekly_halt_hours: 48
+  max_api_errors: 5          # 連続 API エラー上限
+
+# ---------- Notification ----------
+notification:
+  enabled: true
+  discord_webhook_url: ""    # 環境変数 DISCORD_WEBHOOK_URL で上書き
+
+# ---------- Persistence ----------
+persistence:
+  state_file: data/position_state.json
+  candles_dir: data/candles
+  log_dir: logs
+  # MS6 Step3: シグナル時点の板スナップショットを紐づけて残すジャーナル
+  signal_journal_path: data/signals/signal_journal.jsonl
+
+# ---------- Shadow observation (MS6 Step2) ----------
+# 運用対象外シンボル（exchange.shadow_symbols）のシグナルを実注文なしで追跡し、
+# 再入場判断に必要な統計が溜まったらフラグを立てる。蓄積は連続運転で行う。
+shadow:
+  enabled: true
+  journal_path: data/shadow/shadow_trades.jsonl
+  flag_path: data/shadow/reentry_flag.json   # 再入場条件を満たしたときの判定結果
+  # 再入場条件: 新規シャドーが min_trades 件以上、かつ S0（片道 slippage_bps +
+  # commission_bps）前提の期待値 > 0
+  min_trades: 20
+  slippage_bps: 5.0          # S0 の片道スリッページ
+  commission_bps: 10.0       # 片道手数料
+  initial_equity: 100000.0   # シャドーの仮想資金（サイズ計算用）
+  cooldown_bars: 0           # 0 = position.cooldown/entry.cooldown_bars に従う
+
+# ---------- 実板ペーパー（exchange.env: paper） ----------
+# 本番の公開エンドポイント（api.binance.com、認証不要）から足と板を取り、
+# 実際の板の厚みを消費して約定価格・スリッページを決める。実注文は出さない。
+paper:
+  initial_equity: 100000.0        # 模擬口座の初期資金（quote 建て）
+  fallback_slippage_bps: 5.0      # 板が取れないときの片道スリッページ
+  account_file: data/paper/paper_account.json   # 仮想口座（再起動で維持）
+
+# ---------- Signal-time order book snapshot (MS6 Step3) ----------
+orderbook:
+  enabled: true
+  depth_limit: 100           # /api/v3/depth の limit（板の階層数）
+  bands_pct: [0.5, 1.0]      # 厚みを測る mid からの距離（%）
+  timeout_s: 5.0             # 取得失敗でシグナル処理を止めない
+
+# ---------- Backtest ----------
+backtest:
+  data_dir: data/candles
+  initial_equity: 100000.0    # JPY
+  start_date: "2023-03-13"
+  end_date: "2025-12-31"
+  walkforward: false          # true: walk-forward分析を実行

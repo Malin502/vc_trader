@@ -148,11 +148,20 @@ JPY は窓が 1 本しか立たない（30ヶ月窓が 1 本のみ）ため、�
   評価側の判定列と live 側の判定が **0 件不一致**（blocked 157 / open 243）。
 - テスト: `tests/test_htf_gate_g3.py`（11 件）。既存 357 件と合わせて 368 件すべて緑。
 
+## 裁定の執行（2026-11-20）
+
+- 実板ペーパーへの結線: **執行済み**。`config.paper.yaml`（リポジトリ直下・版管理）で
+  `htf_gate.g3.enabled: true`。起動時に `CONFIG` レコードとして構成（`G3` / `fail_closed` /
+  `code_revision` / `config_id`）をジャーナルに残すので、期間ごとの構成を後から再構成できる。
+  W2 は照合・実装後に `whipsaw.w2.enabled: true` で合流（`CONFIG` の区間が切り替わる）。
+- データ欠損時は **live だけ fail-closed**（`data_unavailable` で新規停止＋GATE 記録＋通知）。
+  評価側（`strategy/gates.py` / `evaluate_g3`）の pass-through はそのまま＝**意図的な逸脱**。
+  根拠は RUNBOOK §10 と `config.yaml` のコメントに残した。バックテストには欠損が無いため
+  評価数値には影響しない。
+- 予告: 有効化時点の BTCJPY は SMA200 の下なので、ペーパーは新規停止状態から始まる（設計どおり）。
+
 ## 残作業
 
-- 実板ペーパーへの結線: `config.paper.yaml` で `htf_gate.g3.enabled: true` にすれば有効になる
-  （既定 false）。有効化の判断は照合結果を踏まえて行う。
-- データ欠損時は評価側の意味論どおり「ゲートを開く」。取得失敗が続く間は無防備になるため、
-  GATE ジャーナル（WARNING）と Discord 通知で検知する運用にする。ブロック側に倒すかは別途裁定。
+- W2 の照合・実装が終わり次第 `whipsaw.w2.enabled: true` で合流する（それまで G3 のみで運転）。
 - JPY の日足 SMA200 は 2024-09-27 からしか確定しない（XRP は 2024-11-15）。2024-05〜09 は G1/G3 が効いていない。
 - CSCV は 4 試行・月次リターンでの概算のみ。試行数を増やす場合はブロック長と指標の妥当性を再検討する。
