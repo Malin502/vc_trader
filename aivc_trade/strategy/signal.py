@@ -9,6 +9,7 @@ import pandas as pd
 
 from aivc_trade.core.types import Position, Regime, Side, Signal
 from aivc_trade.core.logger import get_logger
+from aivc_trade.strategy.gates import gate_block_reason
 
 log = get_logger("signal")
 
@@ -333,6 +334,13 @@ def generate_signals(
         # --- Gate 1: Regime must be TREND_UP ---
         # Hysteresis is now applied at the regime level, no need to check here
         if row.get("regime", Regime.RANGE) != Regime.TREND_UP:
+            continue
+
+        # --- Gate 1.5: 高時間軸（日足）ゲート G1〜G3 ---
+        # 既定は全て無効。entry.mode とは独立に効く（決済・サイジングは共通のまま）。
+        blocked_by = gate_block_reason(row, cfg)
+        if blocked_by is not None:
+            log.debug(f"{symbol} blocked by daily gate {blocked_by}")
             continue
 
         # --- Gate 2: Cooldown (bar-based or time-based) ---

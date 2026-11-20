@@ -198,6 +198,22 @@ sizing:
   risk_per_trade_live: 0.01  # 口座資産の 1%（実弾初期）
   max_notional_pct: 0.50     # 1枠あたり投下比率ガード
 
+# ---------- Higher-timeframe entry gates (Step 2a) ----------
+# 事前登録 gate-preregistration-2026-11-20.md の候補 G1〜G3。
+# 既定は全て無効＝現行挙動。日足は 1h 足から集計し、参照するのは
+# 「エントリー時刻の日付より前の、最後に確定した日足」（当日終値は使わない）。
+# sma_fast/slow は 50/200 に固定（閾値探索は禁止）。
+gates:
+  sma_fast_period: 50
+  sma_slow_period: 200
+  g1:
+    enabled: false          # 銘柄の日足終値 < 日足 SMA200 → その銘柄は新規エントリーしない
+  g2:
+    enabled: false          # 銘柄の日足 SMA50 < 日足 SMA200 → その銘柄は新規エントリーしない
+  g3:
+    enabled: false          # 参照銘柄（BTC）の日足終値 < SMA200 → 全銘柄で新規エントリーしない
+    reference: BTC
+
 # ---------- Symbol Score Weights ----------
 score:
   w_slope: 0.6

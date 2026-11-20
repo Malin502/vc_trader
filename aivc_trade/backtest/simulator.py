@@ -25,6 +25,13 @@ from aivc_trade.core.types import (
 )
 from aivc_trade.core.logger import get_logger
 from aivc_trade.data.feature_engine import compute_features_1h, compute_features_5m
+from aivc_trade.strategy.gates import (
+    add_daily_gates,
+    build_daily_frames,
+    daily_gates_enabled,
+    enabled_gates,
+    gate_periods,
+)
 from aivc_trade.strategy.regime import classify_regime, apply_regime_hysteresis
 from aivc_trade.strategy.signal import generate_signals
 from aivc_trade.strategy.sizing import compute_qty
@@ -95,6 +102,15 @@ class Simulator:
             df = feat_1h[sym]
             raw_regimes = df.apply(lambda row: classify_regime(row, self.cfg), axis=1)
             df["regime"] = apply_regime_hysteresis(raw_regimes, confirm_bars)
+
+        # --- 高時間軸（日足）ゲート G1〜G3（既定は全て無効） ---
+        # 1h 足から日足を集計し、各 1h バーに「前日までの確定日足」の判定を付ける。
+        # 無効時は何もしないので、現行挙動と完全に同一。
+        if daily_gates_enabled(self.cfg):
+            fast_p, slow_p = gate_periods(self.cfg)
+            daily = build_daily_frames(candles_1h, fast_p, slow_p)
+            add_daily_gates(feat_1h, daily, self.cfg)
+            log.info(f"daily gates enabled: {enabled_gates(self.cfg)}")
 
         # --- Build unified 1h timeline ---
         all_ts = set()
