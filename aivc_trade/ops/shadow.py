@@ -234,8 +234,12 @@ class ShadowObserver:
         ts: datetime,
         features_1h: Dict[str, pd.DataFrame],
         bar_idx: int = 0,
+        htf_gate: Optional[Any] = None,
     ) -> List[Dict[str, Any]]:
         """Advance the shadow book by one closed 1h bar.
+
+        ``htf_gate`` は live と同じ G3 状態（``strategy.htf_gate.GateStatus``）。
+        実エントリーと同じ条件で止めるため、そのまま ``generate_signals`` に渡す。
 
         Returns the journal records emitted on this bar (entry / partial / exit).
         """
@@ -278,6 +282,7 @@ class ShadowObserver:
             current_positions=held,
             cooldowns_bar=self._cooldowns_bar,
             current_bar_idx=bar_idx,
+            htf_gate=htf_gate,
         )
         for sig in signals:
             if sig.symbol in self.positions:

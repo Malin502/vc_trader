@@ -43,6 +43,7 @@ log = get_logger("signal_journal")
 EVENT_SIGNAL = "SIGNAL"
 EVENT_FILL = "FILL"
 EVENT_STOP = "STOP"
+EVENT_GATE = "GATE"
 
 
 def _iso(ts: datetime) -> str:
@@ -215,6 +216,28 @@ class SignalJournal:
             "order_id": str(order_id) if order_id else None,
             "detail": detail,
         }
+        self._stamp(record, extra)
+        self.append(record)
+        return record
+
+    # ------------------------------------------------------------------
+    # GATE (高時間軸ゲート G3 の状態変化 / 判定不能の警告)
+    # ------------------------------------------------------------------
+    def record_gate(
+        self,
+        status: Dict[str, Any],
+        *,
+        ts: Optional[datetime] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record a G3 state change. ``ok=False`` は「判定不能（ゲートは開く）」。"""
+        record: Dict[str, Any] = {
+            "event": EVENT_GATE,
+            "ts": _iso(ts or datetime.now(timezone.utc)),
+            "mode": self.mode,
+            "level": "INFO" if status.get("ok") else "WARNING",
+        }
+        record.update(status)
         self._stamp(record, extra)
         self.append(record)
         return record

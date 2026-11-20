@@ -38,7 +38,9 @@ from aivc_trade.data.candles_store import CandlesStore
 from aivc_trade.data.feature_engine import compute_features_1h, compute_features_5m
 from aivc_trade.data.orderbook import OrderBookRecorder
 from aivc_trade.strategy.regime import classify_regime
+from aivc_trade.strategy.gates import daily_gates_enabled
 from aivc_trade.strategy.signal import generate_signals
+from aivc_trade.strategy.htf_gate import G3Tracker, g3_config
 from aivc_trade.strategy.sizing import compute_qty, round_down_step
 from aivc_trade.strategy.risk import CircuitBreaker
 from aivc_trade.execution.order_manager import OrderManager
@@ -287,6 +289,33 @@ def main() -> None:
         )
 
     book_recorder = OrderBookRecorder(client, cfg)
+
+    # --- G3: BTC 日足 SMA200 ゲート（起動時に取得、日次更新） ---
+    # 意味論は Step 2a 評価（strategy/gates.py）に準拠: 前日までの確定日足、
+    # 終値 < SMA のときだけ止める。データ不備は「判定不能＝ゲートは開く」。
+    def _on_g3_change(status: Any) -> None:
+        signal_journal.record_gate(status.as_dict(), ts=clock.now())
+        if not status.ok:
+            notifier.notify_error(f"G3 cannot evaluate (gate stays open): {status.reason}")
+
+    g3 = G3Tracker(cfg, client.fetch_klines, on_change=_on_g3_change)
+    if g3.enabled:
+        log.info(
+            f"G3 enabled: {g3_config(cfg)['symbol']} daily close vs "
+            f"SMA{g3_config(cfg)['sma_period']} (live/shadow common)"
+        )
+    else:
+        log.info("G3 disabled (htf_gate.g3.enabled=false)")
+    g3.refresh(clock.now(), force=True)
+    # gates.* はバックテスト専用（1h 足から日足を集計して判定列を付ける）。
+    # live は判定列を作らないため、有効なままだと gate_block_reason が
+    # 「列が無い＝fail-safe」で全銘柄を止める。事故防止に明示警告する。
+    if daily_gates_enabled(cfg):
+        log.warning(
+            "gates.* is enabled but live/shadow does not build daily gate columns; "
+            "all entries would be blocked. Use htf_gate.g3 for live instead."
+        )
+
     # --- MS6 Step2: 運用対象外シンボルのシャドー観測 ---
     shadow = ShadowObserver(cfg)
     shadow_flag_path = (cfg.get("shadow", {}) or {}).get("flag_path")
@@ -766,12 +795,20 @@ def main() -> None:
             # 実発注はしない。シグナル→決済を仮想で追い、journal に積む。
             at_boundary = _is_1h_boundary(now)
             if at_boundary:
+                # G3 は日次（UTC 0:00 以降の最初のループ）で更新。shadow と
+                # 実エントリーが同じバーで同じ判定を使うよう、両者の前に置く。
+                g3.refresh(now)
                 bar_ts = _ts_floor_1h(now)
                 if bar_ts != last_shadow_bar_ts:
                     last_shadow_bar_ts = bar_ts
                     shadow_bar_idx += 1
                     try:
-                        events = shadow.on_bar(now, feat_1h, shadow_bar_idx)
+                        events = shadow.on_bar(
+                            now,
+                            feat_1h,
+                            shadow_bar_idx,
+                            htf_gate=g3.status if g3.enabled else None,
+                        )
                         if events:
                             log.info(f"Shadow events this bar: {len(events)}")
                         if not shadow_flag_written and shadow.enabled:
@@ -794,6 +831,7 @@ def main() -> None:
                     feat_1h, feat_5m, cfg, now,
                     current_positions=list(positions.values()),
                     cooldowns=cooldowns,
+                    htf_gate=g3.status if g3.enabled else None,
                 )
                 # MS6 Step3: シグナル時点の板を記録し、シグナルと紐づけて残す。
                 # 実際に発注できたか（entries_blocked / 枠 / 残高）に関わらず記録する

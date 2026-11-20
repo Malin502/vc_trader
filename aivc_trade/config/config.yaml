@@ -205,6 +205,8 @@ sizing:
 # 既定は全て無効＝現行挙動。日足は 1h 足から集計し、参照するのは
 # 「エントリー時刻の日付より前の、最後に確定した日足」（当日終値は使わない）。
 # sma_fast/slow は 50/200 に固定（閾値探索は禁止）。
+# ※ このセクションはバックテスト専用（simulator が判定列を付ける）。
+#    live / shadow は下の htf_gate.g3 を使う。
 gates:
   sma_fast_period: 50
   sma_slow_period: 200
@@ -215,6 +217,17 @@ gates:
   g3:
     enabled: false          # 参照銘柄（BTC）の日足終値 < SMA200 → 全銘柄で新規エントリーしない
     reference: BTC
+
+# ---------- 高時間軸ゲート G3（live / shadow 用） ----------
+# Step 2a 評価と同じ意味論（UTC 日次・終値のみ・厳密に < で停止・
+# 前日までの確定日足のみ・データ不備はゲートを開く）。
+# ライブの参照銘柄は BTCJPY で確定（評価の USDT 側は BTCUSDT だが、実戦データで統一）。
+# 既定は無効＝現行挙動。実板ペーパーで有効化するときは config.paper.yaml で true にする。
+htf_gate:
+  g3:
+    enabled: false
+    symbol: BTCJPY
+    sma_period: 200
 
 # ---------- Whipsaw 対策 W1〜W3（Step 2b / 事前登録 2026-11-20 追補） ----------
 # 2021 型（タイミングの誤り）への手当て。既定は全て無効＝現行挙動。

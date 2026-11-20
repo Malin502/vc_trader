@@ -267,6 +267,7 @@ def generate_signals(
     cooldowns: Optional[Dict[str, datetime]] = None,
     cooldowns_bar: Optional[Dict[str, int]] = None,
     current_bar_idx: int = 0,
+    htf_gate: Optional[Any] = None,
 ) -> List[Signal]:
     """Evaluate entry conditions for each symbol and return candidate signals.
 
@@ -287,6 +288,9 @@ def generate_signals(
     cooldowns : {symbol: cooldown_until_dt}
     cooldowns_bar : {symbol: bar_index} (backtest bar-based cooldown)
     current_bar_idx : current bar index for bar-based cooldown
+    htf_gate : live / shadow の G3 状態（``strategy.htf_gate.GateStatus``）。
+        ``blocked`` なら全銘柄で新規なし。``None`` はゲート評価なし
+        （バックテストは日足判定列 ``gate_g3_ok`` を使うのでここには来ない）。
 
     Returns
     -------
@@ -297,6 +301,14 @@ def generate_signals(
         cooldowns = {}
     if cooldowns_bar is None:
         cooldowns_bar = {}
+
+    # --- G3（高時間軸ゲート）: BTC 日足終値 < SMA200 の間は全銘柄で新規なし ---
+    # 判定列（gate_g3_ok）はバックテストの経路。live / shadow は 1d 足から
+    # 評価した GateStatus をここに渡す。blocked=False にはデータ不備
+    # （判定不能＝ゲートは開く）も含まれる（評価側と同じ意味論）。
+    if htf_gate is not None and getattr(htf_gate, "blocked", False):
+        log.debug(f"G3 blocks all new entries: {getattr(htf_gate, 'reason', '')}")
+        return []
 
     position_cfg = cfg.get("position", {})
     max_concurrent = int(position_cfg.get("max_concurrent", 1))
