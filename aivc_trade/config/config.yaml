@@ -82,6 +82,10 @@ regime:
 
 # ---------- Entry Conditions ----------
 entry:
+  # full       : 現行（レジーム + ret24h/entry_filter/ブレイク/出来高/品質）
+  # regime_only: 比較用の簡素版（TREND_UP 判定のみ。決済・サイジング・
+  #              クールダウンは full と同一）
+  mode: full
   ret24h_min_pct: 2.0          # 直近24hリターン条件を緩和（攻撃寄り）
   atr_pct_min: 1.0             # 旧ゲート（後方互換）
   cooldown_bars: 24            # 決済後のクールダウン (bars, 24h)
@@ -215,6 +219,9 @@ stop_order:
   # bot の手仕舞いは終値ベースなので、同じ価格に置くとザラ場のタッチで取引所側が
   # 先に約定し、bot 側の制御が効かなくなる。0 で完全一致（＝挙動が変わる）。
   safety_buffer_pct: 0.3
+  # ラチェット (cancelReplace) の連続失敗がこの回数に達したら Discord に明示通知
+  # （M4b 持ち越し）。1回の失敗は復旧処理で吸収されるため、繰り返す場合だけ上げる。
+  ratchet_alert_after: 3
 
 # ---------- Circuit Breaker ----------
 circuit_breaker:

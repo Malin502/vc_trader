@@ -1,0 +1,39 @@
+[Unit]
+Description=AIVC Trade - paper run (Binance Testnet)
+Documentation=file:/opt/aivc_trade/doc/paper_deploy/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aivc
+Group=aivc
+WorkingDirectory=/opt/aivc_trade
+# Testnet の資格情報。600 で配置し、リポジトリには入れない。
+EnvironmentFile=/opt/aivc_trade/.env.testnet
+Environment=AIVC_EXCHANGE_ENV=testnet
+Environment=AIVC_CONFIG_PATH=/opt/aivc_trade/config.testnet.yaml
+Environment=PYTHONUNBUFFERED=1
+
+# 起動前チェック: testnet 以外・照合失敗・未約定の異常があればここで止まる。
+# ExecStartPre が non-zero を返すと ExecStart は実行されない。
+ExecStartPre=/opt/aivc_trade/.venv/bin/python /opt/aivc_trade/preflight_reconcile.py --config /opt/aivc_trade/config.testnet.yaml --env-file /opt/aivc_trade/.env.testnet
+ExecStart=/opt/aivc_trade/.venv/bin/python /opt/aivc_trade/aivc_trade/main_live.py
+
+# SIGTERM は「イテレーションの切れ目で状態保存して終了」に使う。SIGKILL は避ける。
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=90
+
+Restart=on-failure
+RestartSec=30
+
+# ログは loguru が logs/ にも書く。journald 側はここで確認。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aivc-trade
+
+# 念のため: 誤って本番 config を指しても、env 側で testnet を強制している。
+
+[Install]
+WantedBy=multi-user.target

@@ -300,6 +300,12 @@ def generate_signals(
     max_concurrent = int(position_cfg.get("max_concurrent", 1))
     max_per_symbol = int(position_cfg.get("max_per_symbol", 1))
 
+    # Entry mode: "full" = 現行（レジーム + ブレイク/品質などの追加条件）、
+    # "regime_only" = 比較用の簡素版（TREND_UP 判定のみ。決済・サイジング・
+    # クールダウンは現行と同一）。
+    entry_mode = str(cfg.get("entry", {}).get("mode", "full")).strip().lower()
+    regime_only = entry_mode == "regime_only"
+
     held = _held_position_counts(current_position, current_positions)
     open_count = sum(held.values())
     free_slots = max_concurrent - open_count
@@ -340,29 +346,31 @@ def generate_signals(
                 log.debug(f"{symbol} in cooldown until {cd}")
                 continue
 
-        # --- Gate 3: ret_24h minimum (momentum filter) ---
-        if not _check_ret24h_minimum(row, cfg):
-            continue
+        # --- Gate 3-8: 追加のエントリー条件（簡素版では外す） ---
+        if not regime_only:
+            # --- Gate 3: ret_24h minimum (momentum filter) ---
+            if not _check_ret24h_minimum(row, cfg):
+                continue
 
-        # --- Gate 4: Entry filter (ADX + MA + ATR%) ---
-        if not _check_entry_filter(row, cfg):
-            continue
+            # --- Gate 4: Entry filter (ADX + MA + ATR%) ---
+            if not _check_entry_filter(row, cfg):
+                continue
 
-        # --- Gate 5: ATR% minimum (legacy volatility filter) ---
-        if not _check_atr_pct_min(row, cfg):
-            continue
+            # --- Gate 5: ATR% minimum (legacy volatility filter) ---
+            if not _check_atr_pct_min(row, cfg):
+                continue
 
-        # --- Gate 6: Entry trigger (pullback OR breakout) ---
-        if not _check_entry_trigger(row, cfg):
-            continue
+            # --- Gate 6: Entry trigger (pullback OR breakout) ---
+            if not _check_entry_trigger(row, cfg):
+                continue
 
-        # --- Gate 7: Volume filter ---
-        if cfg["entry"].get("volume_above_sma", True) and not _check_volume(row):
-            continue
+            # --- Gate 7: Volume filter ---
+            if cfg["entry"].get("volume_above_sma", True) and not _check_volume(row):
+                continue
 
-        # --- Gate 8: Entry quality filter ---
-        if not _check_entry_quality(row, cfg):
-            continue
+            # --- Gate 8: Entry quality filter ---
+            if not _check_entry_quality(row, cfg):
+                continue
 
         # --- Compute stop ---
         atr_val = row["atr"]
@@ -379,14 +387,17 @@ def generate_signals(
         stop_price = max(stop_by_atr, stop_by_structure)
 
         # Determine entry type
-        is_pullback = _check_pullback(row, cfg)
-        is_breakout = _check_breakout(row, cfg)
-        if is_pullback and is_breakout:
-            entry_type = "PULLBACK_BREAKOUT"
-        elif is_pullback:
-            entry_type = "PULLBACK"
+        if regime_only:
+            entry_type = "REGIME_ONLY"
         else:
-            entry_type = "BREAKOUT"
+            is_pullback = _check_pullback(row, cfg)
+            is_breakout = _check_breakout(row, cfg)
+            if is_pullback and is_breakout:
+                entry_type = "PULLBACK_BREAKOUT"
+            elif is_pullback:
+                entry_type = "PULLBACK"
+            else:
+                entry_type = "BREAKOUT"
 
         score = compute_score(row, cfg)
 

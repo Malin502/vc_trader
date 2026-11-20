@@ -1,24 +1,29 @@
 """Signal journal – シグナル時点の記録を板スナップショットと紐づけて残す (MS6 Step 3).
 
-1 シグナル = 1 行の JSON（JSONL）。後日「シグナル時点の板」と「想定約定価格
-（``signal.entry_price``）」と「実際の fill」を突き合わせれば、実効スリッページを
-シグナル単位で裏取りできる。
+ペーパー運転（Step 1'）の評価指標を 1 つの JSONL から集計できるようにする。
+記録は ``event`` で種類を分ける（古い行は ``event`` を持たないので SIGNAL 扱い）。
+
+* ``SIGNAL`` – シグナル時点の想定（``entry_price`` / ``stop_price``）と板
+* ``FILL``   – 実際の約定（``expected_price`` との乖離＝実効スリッページ、手数料）
+* ``STOP``   – 取引所側 STOP の設置 / ラチェット / 取消の成否
 
 行の形::
 
-    {
-      "signal_id": "20261119T120000-BTCJPY-1a2b3c4d",
-      "ts": "2026-11-19T12:00:00+00:00",
-      "mode": "paper",                  # sizing.risk_mode
-      "action": "ENTRY_CANDIDATE",      # 呼び出し側の任意ラベル
-      "symbol": "BTCJPY",
-      "side": "BUY",
-      "entry_type": "BREAKOUT",
-      "score": 0.123,
-      "entry_price": 12345678.0,        # シグナル時点の想定約定価格
-      "stop_price": 12000000.0,
-      "orderbook": { ... }              # data.orderbook.summarize_depth の出力
-    }
+    {"event": "SIGNAL", "signal_id": "20261119T120000-BTCJPY-1a2b3c4d",
+     "ts": "...", "bar_ts": "...", "mode": "paper", "action": "ENTRY_CANDIDATE",
+     "symbol": "BTCJPY", "side": "BUY", "entry_type": "BREAKOUT", "score": 0.123,
+     "entry_price": 12345678.0, "stop_price": 12000000.0, "orderbook": {...}}
+
+    {"event": "FILL", "ts": "...", "signal_id": "...", "kind": "ENTRY",
+     "symbol": "BTCJPY", "side": "BUY", "qty": 0.001, "price": 12346000.0,
+     "expected_price": 12345678.0, "slippage_bps": 0.26,
+     "fee": 12.3, "fee_asset": "JPY", "order_id": "123"}
+
+    {"event": "STOP", "ts": "...", "symbol": "BTCJPY", "kind": "PLACED",
+     "ok": true, "step": "initial", "stop_price": 12000000.0, "order_id": "456"}
+
+``bar_ts`` はシグナル判定に使った 1h 足の開始時刻。バックテストのシグナルと
+(symbol, bar_ts) で突き合わせる＝シグナル一致率の元データになる。
 """
 
 from __future__ import annotations
@@ -34,6 +39,11 @@ from aivc_trade.core.types import Signal
 
 log = get_logger("signal_journal")
 
+#: レコード種別（``event`` フィールド）
+EVENT_SIGNAL = "SIGNAL"
+EVENT_FILL = "FILL"
+EVENT_STOP = "STOP"
+
 
 def _iso(ts: datetime) -> str:
     if ts.tzinfo is None:
@@ -45,8 +55,20 @@ def _side_value(side: Any) -> str:
     return getattr(side, "value", str(side))
 
 
+def slippage_bps(price: float, expected: float, side: str = "BUY") -> Optional[float]:
+    """約定価格が想定からどれだけ離れたか（bps、不利方向を正）。
+
+    BUY は高く約定するほど、SELL は安く約定するほどコストなので、符号を
+    「不利＝正」に揃えておくとレポートでそのまま合算できる。
+    """
+    if not expected or expected <= 0 or price is None:
+        return None
+    raw = (float(price) - float(expected)) / float(expected) * 10_000.0
+    return raw if str(side).upper() == "BUY" else -raw
+
+
 class SignalJournal:
-    """Append-only JSONL writer for signal-time records."""
+    """Append-only JSONL writer for signal / fill / stop records."""
 
     def __init__(
         self,
@@ -59,6 +81,9 @@ class SignalJournal:
         self.mode = str(mode)
         self.enabled = bool(enabled)
 
+    # ------------------------------------------------------------------
+    # SIGNAL
+    # ------------------------------------------------------------------
     def record(
         self,
         signal: Signal,
@@ -67,6 +92,8 @@ class SignalJournal:
         orderbook: Optional[Dict[str, Any]] = None,
         action: str = "ENTRY_CANDIDATE",
         extra: Optional[Dict[str, Any]] = None,
+        bar_ts: Optional[datetime] = None,
+        signal_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Build, persist and return the record for *signal*.
 
@@ -74,11 +101,15 @@ class SignalJournal:
         the record is returned regardless and the error is logged.
         """
         ts = ts or signal.ts or datetime.now(timezone.utc)
-        signal_id = f"{ts.strftime('%Y%m%dT%H%M%S')}-{signal.symbol}-{uuid.uuid4().hex[:8]}"
+        signal_id = signal_id or (
+            f"{ts.strftime('%Y%m%dT%H%M%S')}-{signal.symbol}-{uuid.uuid4().hex[:8]}"
+        )
 
         record: Dict[str, Any] = {
+            "event": EVENT_SIGNAL,
             "signal_id": signal_id,
             "ts": _iso(ts),
+            "bar_ts": _iso(bar_ts) if bar_ts is not None else None,
             "mode": self.mode,
             "action": action,
             "symbol": signal.symbol,
@@ -95,6 +126,95 @@ class SignalJournal:
         self.append(record)
         return record
 
+    # ------------------------------------------------------------------
+    # FILL
+    # ------------------------------------------------------------------
+    def record_fill(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float,
+        ts: Optional[datetime] = None,
+        kind: str = "ENTRY",
+        signal_id: Optional[str] = None,
+        expected_price: Optional[float] = None,
+        fee: float = 0.0,
+        fee_asset: str = "",
+        order_id: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record one real fill (entry / exit / partial).
+
+        ``expected_price`` はシグナル時点の想定価格（``signal.entry_price``）。
+        ここから ``slippage_bps`` を計算して残すので、レポート側で再計算不要。
+        """
+        record: Dict[str, Any] = {
+            "event": EVENT_FILL,
+            "ts": _iso(ts or datetime.now(timezone.utc)),
+            "mode": self.mode,
+            "kind": str(kind).upper(),
+            "signal_id": signal_id,
+            "symbol": symbol,
+            "side": str(side).upper(),
+            "qty": float(qty),
+            "price": float(price),
+            "expected_price": float(expected_price) if expected_price else None,
+            "slippage_bps": slippage_bps(price, expected_price or 0.0, side),
+            "fee": float(fee or 0.0),
+            "fee_asset": str(fee_asset or ""),
+            "order_id": str(order_id) if order_id else None,
+        }
+        if extra:
+            record.update(extra)
+        self.append(record)
+        return record
+
+    # ------------------------------------------------------------------
+    # STOP (取引所側 STOP_LOSS の成否)
+    # ------------------------------------------------------------------
+    def record_stop(
+        self,
+        *,
+        symbol: str,
+        kind: str,
+        ok: bool,
+        ts: Optional[datetime] = None,
+        step: str = "",
+        stop_price: Optional[float] = None,
+        qty: Optional[float] = None,
+        order_id: Optional[str] = None,
+        detail: str = "",
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record the outcome of one exchange-stop operation.
+
+        ``kind`` は ``PLACED`` / ``RATCHET`` / ``RESIZE`` / ``CANCELLED`` /
+        ``RECONCILED``。失敗も同じ形で残すので「STOP 失敗 1 件＝停止条件」を
+        レポートで数えられる。
+        """
+        record: Dict[str, Any] = {
+            "event": EVENT_STOP,
+            "ts": _iso(ts or datetime.now(timezone.utc)),
+            "mode": self.mode,
+            "kind": str(kind).upper(),
+            "ok": bool(ok),
+            "step": str(step),
+            "symbol": symbol,
+            "stop_price": float(stop_price) if stop_price is not None else None,
+            "qty": float(qty) if qty is not None else None,
+            "order_id": str(order_id) if order_id else None,
+            "detail": detail,
+        }
+        if extra:
+            record.update(extra)
+        self.append(record)
+        return record
+
+    # ------------------------------------------------------------------
+    # Low level
+    # ------------------------------------------------------------------
     def append(self, record: Dict[str, Any]) -> None:
         if not self.enabled:
             return

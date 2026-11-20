@@ -1,0 +1,17 @@
+[Unit]
+Description=AIVC Trade - daily paper metrics report
+Documentation=file:/opt/aivc_trade/doc/paper_deploy/RUNBOOK.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=aivc
+Group=aivc
+WorkingDirectory=/opt/aivc_trade
+EnvironmentFile=/opt/aivc_trade/.env.testnet
+Environment=AIVC_EXCHANGE_ENV=testnet
+Environment=AIVC_CONFIG_PATH=/opt/aivc_trade/config.testnet.yaml
+
+# 停止条件に該当すると終了コード 3（oneshot の失敗として残る）。
+# --notify を付けると DISCORD_WEBHOOK_URL へも上げる。
+ExecStart=/opt/aivc_trade/.venv/bin/python /opt/aivc_trade/paper_report.py --notify
