@@ -30,6 +30,7 @@ def compute_qty(
     lot_step: float = 0.00001,
     min_qty: float = 0.0,
     min_notional: float = DEFAULT_MIN_NOTIONAL,
+    risk_scale: float = 1.0,
 ) -> float:
     """Compute order quantity respecting the per-trade and per-slot limits.
 
@@ -48,6 +49,7 @@ def compute_qty(
     lot_step : exchange LOT_SIZE stepSize
     min_qty : exchange LOT_SIZE minQty
     min_notional : exchange NOTIONAL minNotional (0.0 = not enforced)
+    risk_scale : multiplier on the per-trade risk (W1: 0.5 in high-vol periods)
 
     Returns
     -------
@@ -58,7 +60,7 @@ def compute_qty(
         return 0.0
 
     sizing_cfg = cfg.get("sizing", {})
-    risk_pct_cfg = resolve_risk_per_trade(sizing_cfg)
+    risk_pct_cfg = resolve_risk_per_trade(sizing_cfg) * float(risk_scale)
     risk_per_trade = equity * risk_pct_cfg
     stop_dist = signal.entry_price - signal.stop_price
 

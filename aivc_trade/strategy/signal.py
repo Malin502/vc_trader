@@ -9,6 +9,9 @@ import pandas as pd
 
 from aivc_trade.core.types import Position, Regime, Side, Signal
 from aivc_trade.core.logger import get_logger
+from aivc_trade.strategy.gates import gate_block_reason
+from aivc_trade.strategy.whipsaw import whipsaw_block_reason
+from aivc_trade.strategy.whipsaw_live import w2_block_reason
 
 log = get_logger("signal")
 
@@ -265,6 +268,9 @@ def generate_signals(
     cooldowns: Optional[Dict[str, datetime]] = None,
     cooldowns_bar: Optional[Dict[str, int]] = None,
     current_bar_idx: int = 0,
+    htf_gate: Optional[Any] = None,
+    vol_gate: Optional[Dict[str, Any]] = None,
+    blocked_out: Optional[List[Any]] = None,
 ) -> List[Signal]:
     """Evaluate entry conditions for each symbol and return candidate signals.
 
@@ -285,6 +291,17 @@ def generate_signals(
     cooldowns : {symbol: cooldown_until_dt}
     cooldowns_bar : {symbol: bar_index} (backtest bar-based cooldown)
     current_bar_idx : current bar index for bar-based cooldown
+    htf_gate : live / shadow の G3 状態（``strategy.htf_gate.GateStatus``）。
+        ``blocked`` なら全銘柄で新規なし。``None`` はゲート評価なし
+        （バックテストは日足判定列 ``gate_g3_ok`` を使うのでここには来ない）。
+    vol_gate : live / shadow の W2 状態（``{symbol: strategy.whipsaw_live.W2Status}``）。
+        銘柄ごとに ``blocked`` ならその銘柄の新規なし。``None`` は W2 を評価して
+        いない（バックテストは特徴量の列 ``w2_ok`` で判定する）。
+        dict に銘柄が無い場合は停止（fail-safe、評価側の「列が無い」と同じ）。
+    blocked_out : 省略可（シャドー観測用）。W2 が止めた**候補**の ``W2Status`` を
+        ここに積む。エントリー条件を通過した後に W2 を判定するので、積まれた
+        銘柄は「この足でシグナルが出ていたはずのもの」。``vol_gate`` が ``None``
+        （バックテスト経路）では何も積まない。
 
     Returns
     -------
@@ -295,6 +312,14 @@ def generate_signals(
         cooldowns = {}
     if cooldowns_bar is None:
         cooldowns_bar = {}
+
+    # --- G3（高時間軸ゲート）: BTC 日足終値 < SMA200 の間は全銘柄で新規なし ---
+    # 判定列（gate_g3_ok）はバックテストの経路。live / shadow は 1d 足から
+    # 評価した GateStatus をここに渡す。blocked=False にはデータ不備
+    # （判定不能＝ゲートは開く）も含まれる（評価側と同じ意味論）。
+    if htf_gate is not None and getattr(htf_gate, "blocked", False):
+        log.debug(f"G3 blocks all new entries: {getattr(htf_gate, 'reason', '')}")
+        return []
 
     position_cfg = cfg.get("position", {})
     max_concurrent = int(position_cfg.get("max_concurrent", 1))
@@ -335,6 +360,13 @@ def generate_signals(
         if row.get("regime", Regime.RANGE) != Regime.TREND_UP:
             continue
 
+        # --- Gate 1.5: 高時間軸（日足）ゲート G1〜G3 ---
+        # 既定は全て無効。entry.mode とは独立に効く（決済・サイジングは共通のまま）。
+        blocked_by = gate_block_reason(row, cfg)
+        if blocked_by is not None:
+            log.debug(f"{symbol} blocked by daily gate {blocked_by}")
+            continue
+
         # --- Gate 2: Cooldown (bar-based or time-based) ---
         if cooldowns_bar:
             if check_cooldown_bars(symbol, cooldowns_bar, current_bar_idx):
@@ -371,6 +403,28 @@ def generate_signals(
             # --- Gate 8: Entry quality filter ---
             if not _check_entry_quality(row, cfg):
                 continue
+
+        # --- Gate 1.6: W2（高ボラ期間の間引き、銘柄ごと） ---
+        # 既定は無効。W1（サイズ半減）はサイジング側で効くのでここでは見ない。
+        #   live / shadow : 日足から評価した ``vol_gate``（W2Status）で判定する。
+        #   backtest      : 特徴量の列 ``w2_ok``（add_whipsaw_columns）で判定する。
+        # 両方を同時に見ると live では列が無い＝全銘柄停止になるため、
+        # vol_gate が渡されたときは列側は見ない（意味論は同じ）。
+        #
+        # 位置は **エントリー条件を通過した後**（2026-11-20 シャドー結線）。判定結果は
+        # 「この足で建てるはずだった候補を W2 が止めた」を意味するので、シャドーは
+        # これをそのままジャーナルに残せる（「シグナル無し」と区別できる）。W2 は
+        # 銘柄ごと・他の条件と独立なので、通す/止めるの集合は位置に依存しない。
+        w2_reason = (
+            w2_block_reason(symbol, vol_gate)
+            if vol_gate is not None
+            else whipsaw_block_reason(row, cfg)
+        )
+        if w2_reason is not None:
+            log.debug(f"{symbol} blocked by W2: {w2_reason}")
+            if blocked_out is not None and vol_gate is not None:
+                blocked_out.append(vol_gate.get(symbol))
+            continue
 
         # --- Compute stop ---
         atr_val = row["atr"]

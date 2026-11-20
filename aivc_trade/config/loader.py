@@ -2,7 +2,7 @@
 
 Derived values injected by :func:`load_config`:
 
-* ``exchange.env``         – normalised to ``prod`` / ``testnet``
+* ``exchange.env``         – normalised to ``prod`` / ``testnet`` / ``paper``
 * ``sizing.risk_per_trade`` – effective per-trade risk for the active ``risk_mode``
 
 The API host is intentionally **not** injected: call :func:`resolve_base_url`
@@ -22,11 +22,18 @@ import yaml
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
-EXCHANGE_ENVS = ("prod", "testnet")
+EXCHANGE_ENVS = ("prod", "testnet", "paper")
 RISK_MODES = ("paper", "live")
 STOP_ORDER_TYPES = ("STOP_LOSS", "STOP_LOSS_LIMIT")
 
 _CLIENT_ORDER_PREFIX_RE = re.compile(r"^[A-Za-z0-9_.-]{1,20}$")
+
+
+def _resolve_env(cfg: Dict[str, Any], override: str | None = None) -> str:
+    """Effective ``exchange.env`` (``AIVC_EXCHANGE_ENV`` wins over config)."""
+    exchange = cfg.get("exchange", {}) or {}
+    raw = override or exchange.get("env") or "prod"
+    return str(raw).strip().lower()
 
 
 def load_config(path: str | Path | None = None) -> Dict[str, Any]:
@@ -41,10 +48,18 @@ def load_config(path: str | Path | None = None) -> Dict[str, Any]:
 
     # --- Environment variable overrides ---
     _env = os.environ.get
-    if _env("BINANCE_API_KEY"):
-        cfg.setdefault("secrets", {})["api_key"] = _env("BINANCE_API_KEY", "")
-    if _env("BINANCE_API_SECRET"):
-        cfg.setdefault("secrets", {})["api_secret"] = _env("BINANCE_API_SECRET", "")
+    # 実板ペーパー（``exchange.env: paper``）は署名付きエンドポイントへの経路を
+    # 持たないため、資格情報は **読まない**（環境変数が残っていても cfg に載せない）。
+    # これが「paper モードでは API キーを読まない」の実装上の担保になる。
+    _effective_env = _resolve_env(cfg, _env("AIVC_EXCHANGE_ENV"))
+    if _effective_env != "paper":
+        if _env("BINANCE_API_KEY"):
+            cfg.setdefault("secrets", {})["api_key"] = _env("BINANCE_API_KEY", "")
+        if _env("BINANCE_API_SECRET"):
+            cfg.setdefault("secrets", {})["api_secret"] = _env("BINANCE_API_SECRET", "")
+    else:
+        # config.yaml に secrets が書かれていても paper では持ち込まない。
+        cfg.pop("secrets", None)
     if _env("DISCORD_WEBHOOK_URL"):
         cfg["notification"]["discord_webhook_url"] = _env("DISCORD_WEBHOOK_URL", "")
     if _env("AIVC_INITIAL_EQUITY"):
@@ -122,14 +137,23 @@ def watched_symbols(cfg: Dict[str, Any]) -> list:
     return out
 
 
+def is_paper_env(cfg: Dict[str, Any]) -> bool:
+    """True when ``exchange.env`` is ``paper`` (実板ペーパー)."""
+    env = str((cfg.get("exchange", {}) or {}).get("env") or "prod").strip().lower()
+    return env == "paper"
+
+
 def resolve_base_url(cfg: Dict[str, Any]) -> str:
     """Return the API base URL for the configured ``exchange.env``.
 
     ``prod`` reads ``exchange.base_url`` (``https://api.binance.com`` — Binance
     Japan runs on the global platform, so the global API host is correct),
-    ``testnet`` reads ``exchange.testnet_base_url``.  Raises ``ValueError`` when
-    the selected host is missing so a misconfigured deployment fails fast
-    instead of silently trading against the wrong venue.
+    ``testnet`` reads ``exchange.testnet_base_url``, and ``paper`` reads
+    ``exchange.base_url`` as well: 実板ペーパーは **本番の公開エンドポイント**
+    だけを使い、発注はしない（署名付き経路は存在しない）。
+
+    Raises ``ValueError`` when the selected host is missing so a misconfigured
+    deployment fails fast instead of silently trading against the wrong venue.
     """
     exchange = cfg.get("exchange", {})
     env = str(exchange.get("env") or "prod").strip().lower()
@@ -138,7 +162,7 @@ def resolve_base_url(cfg: Dict[str, Any]) -> str:
             f"Invalid config: exchange.env must be one of {EXCHANGE_ENVS}, got {env!r}"
         )
 
-    key = "base_url" if env == "prod" else "testnet_base_url"
+    key = "testnet_base_url" if env == "testnet" else "base_url"
     url = str(exchange.get(key) or "").strip().rstrip("/")
     if not url:
         raise ValueError(
@@ -163,6 +187,8 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     _validate_drawdown(cfg)
     _validate_shadow(cfg)
     _validate_orderbook(cfg)
+    _validate_whipsaw(cfg)
+    _validate_paper(cfg)
 
     risk_cfg = cfg.get("risk", {})
     initial_sl = risk_cfg.get("initial_sl", {})
@@ -421,3 +447,86 @@ def _validate_orderbook(cfg: Dict[str, Any]) -> None:
     timeout = float(ob.get("timeout_s", 5.0))
     if timeout <= 0:
         raise ValueError("Invalid config: orderbook.timeout_s must be > 0")
+
+
+def _validate_paper(cfg: Dict[str, Any]) -> None:
+    """実板ペーパー（``exchange.env: paper``）の設定値."""
+    paper = cfg.get("paper") or {}
+    if not paper:
+        return
+
+    equity = float(paper.get("initial_equity", 0.0) or 0.0)
+    if equity <= 0:
+        raise ValueError("Invalid config: paper.initial_equity must be > 0")
+
+    fallback = float(paper.get("fallback_slippage_bps", 0.0) or 0.0)
+    if fallback < 0:
+        raise ValueError("Invalid config: paper.fallback_slippage_bps must be >= 0")
+
+
+def _validate_whipsaw(cfg: Dict[str, Any]) -> None:
+    """Whipsaw 対策 W1〜W3（Step 2b）の設定値.
+
+    事前登録で固定した値（30/365/0.80/0.90・14日3件7日）を config で
+    上書きできる形にしてあるが、値の妥当性だけは検査する（閾値探索は禁止）。
+    """
+    ws = cfg.get("whipsaw") or {}
+    if not ws:
+        return
+
+    for key in ("w1", "w2"):
+        sec = ws.get(key) or {}
+        if not sec:
+            continue
+        for name in ("vol_window_days", "ref_window_days"):
+            value = int(sec.get(name, 1))
+            if value < 2:
+                raise ValueError(f"Invalid config: whipsaw.{key}.{name} must be >= 2")
+        if int(sec.get("vol_window_days", 30)) > int(sec.get("ref_window_days", 365)):
+            raise ValueError(
+                f"Invalid config: whipsaw.{key}.vol_window_days must be <= ref_window_days"
+            )
+        q = float(sec.get("percentile", 0.5))
+        if not (0.0 < q < 1.0):
+            raise ValueError(
+                f"Invalid config: whipsaw.{key}.percentile must satisfy 0 < x < 1, got {q}"
+            )
+
+    w1 = ws.get("w1") or {}
+    if w1:
+        scale = float(w1.get("risk_scale", 1.0))
+        if not (0.0 < scale <= 1.0):
+            raise ValueError(
+                "Invalid config: whipsaw.w1.risk_scale must satisfy 0 < x <= 1, "
+                f"got {scale}"
+            )
+
+    # W2 の live 結線（2026-11-20）: 取得は 1 回の日足 API 呼び出しに収める必要が
+    # ある（G3 と共通の DailyBarCache）。Binance の 1 回上限は 1000 本。
+    w2 = ws.get("w2") or {}
+    if w2:
+        window = int(w2.get("vol_window_days", 30))
+        ref = int(w2.get("ref_window_days", 365))
+        if window + ref > 900:
+            raise ValueError(
+                "Invalid config: whipsaw.w2 needs vol_window_days + ref_window_days <= 900 "
+                f"(single daily fetch, Binance limit 1000), got {window + ref}"
+            )
+        policy = str(w2.get("on_insufficient_history", "pass"))
+        if policy not in ("pass", "block"):
+            raise ValueError(
+                "Invalid config: whipsaw.w2.on_insufficient_history must be pass|block, "
+                f"got {policy}"
+            )
+
+    w3 = ws.get("w3") or {}
+    if w3:
+        window = int(w3.get("stop_window_days", 14))
+        count = int(w3.get("stop_count", 3))
+        halt = int(w3.get("halt_days", 7))
+        if window < 1:
+            raise ValueError("Invalid config: whipsaw.w3.stop_window_days must be >= 1")
+        if count < 1:
+            raise ValueError("Invalid config: whipsaw.w3.stop_count must be >= 1")
+        if halt < 1:
+            raise ValueError("Invalid config: whipsaw.w3.halt_days must be >= 1")

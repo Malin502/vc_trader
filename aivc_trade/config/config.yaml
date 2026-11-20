@@ -4,7 +4,9 @@
 
 exchange:
   name: binance
-  # prod | testnet — loader.resolve_base_url() が接続先を切り替える
+  # prod | testnet | paper
+  #   paper = 実板ペーパー: 本番の公開データ（認証不要）+ 実際の板での模擬約定。
+  #           API キーを読まず、署名付き経路を作らない（Testnet の置き換え）。
   env: prod
   # prod 用 API ホスト。Binance Japan の公式サービスはグローバル基盤
   # (binance.com/ja) 上にあり、API も api.binance.com が正。
@@ -198,6 +200,73 @@ sizing:
   risk_per_trade_live: 0.01  # 口座資産の 1%（実弾初期）
   max_notional_pct: 0.50     # 1枠あたり投下比率ガード
 
+# ---------- Higher-timeframe entry gates (Step 2a) ----------
+# 事前登録 gate-preregistration-2026-11-20.md の候補 G1〜G3。
+# 既定は全て無効＝現行挙動。日足は 1h 足から集計し、参照するのは
+# 「エントリー時刻の日付より前の、最後に確定した日足」（当日終値は使わない）。
+# sma_fast/slow は 50/200 に固定（閾値探索は禁止）。
+# ※ このセクションはバックテスト専用（simulator が判定列を付ける）。
+#    live / shadow は下の htf_gate.g3 を使う。
+gates:
+  sma_fast_period: 50
+  sma_slow_period: 200
+  g1:
+    enabled: false          # 銘柄の日足終値 < 日足 SMA200 → その銘柄は新規エントリーしない
+  g2:
+    enabled: false          # 銘柄の日足 SMA50 < 日足 SMA200 → その銘柄は新規エントリーしない
+  g3:
+    enabled: false          # 参照銘柄（BTC）の日足終値 < SMA200 → 全銘柄で新規エントリーしない
+    reference: BTC
+
+# ---------- 高時間軸ゲート G3（live / shadow 用） ----------
+# Step 2a 評価と同じ意味論（UTC 日次・終値のみ・厳密に < で停止・
+# 前日までの確定日足のみ）。
+# ライブの参照銘柄は BTCJPY で確定（評価の USDT 側は BTCUSDT だが、実戦データで統一）。
+# 既定は無効＝現行挙動。実板ペーパーは config.paper.yaml で有効化する。
+#
+# fail_closed は**評価側からの意図的な逸脱**（裁定 2026-11-20）:
+#   評価はデータ欠損を pass-through（ゲートを開く）するが、live（paper 含む）は
+#   欠損・陳腐化したら `data_unavailable` で新規エントリーを止める。
+#   バックテストには欠損が無いため評価数値には影響しない。実運用では
+#   「データが壊れたら黙って開かない」を優先する（M4a と同じ設計）。
+#   止めた事実は journal の GATE（level=WARNING）と Discord 通知に残る。
+htf_gate:
+  g3:
+    enabled: false
+    symbol: BTCJPY
+    sma_period: 200
+    fail_closed: true       # 既定 true。false は評価と同じ意味論（比較用・通常運用では使わない）
+
+# ---------- Whipsaw 対策 W1〜W3（Step 2b / 事前登録 2026-11-20 追補） ----------
+# 2021 型（タイミングの誤り）への手当て。既定は全て無効＝現行挙動。
+# 指標は日足リターンの 30 日標準偏差と、その過去 1 年（365 日）分位点。
+# 参照するのは「エントリー日の前日までの確定日足」だけ（先読みなし）。
+# パーセンタイル分布が未確定（履歴不足）の期間はゲートしない。
+whipsaw:
+  w1:
+    enabled: false          # ボラ連動サイズ: rv30 > 過去1年 80%tile → リスク半減
+    vol_window_days: 30
+    ref_window_days: 365
+    percentile: 0.80
+    risk_scale: 0.5         # 高ボラ期間のリスク倍率（1 トレードのリスクを半分）
+  w2:
+    enabled: false          # ボラ連動の間引き: rv30 > 過去1年 90%tile → 新規エントリーしない
+    vol_window_days: 30
+    ref_window_days: 365
+    percentile: 0.90
+    # 履歴不足（確定日足が 30+365=395 本に満たない＝上場直後など）のあいだ止めるか。
+    #   pass  : ゲートしない（既定。Step 2b 評価実装と同じ意味論）
+    #   block : 履歴が揃うまで止める（安全側の運用オプション）
+    # 原則（裁定 2026-11-20）: ゲートが止めるのは、リスクの積極証拠（高ボラ）か、
+    # データの破損（無し・列無し・取得失敗・陳腐化・欠け）のときだけ。
+    # 証拠の不在はリスクとして扱わない（データ失敗はこの設定に関わらず常に停止）。
+    on_insufficient_history: pass
+  w3:
+    enabled: false          # ストップ連敗ブレーキ（全銘柄共通）
+    stop_window_days: 14    # この期間内の STOP_LOSS 件数を見る
+    stop_count: 3           # 3 件に達したら
+    halt_days: 7            # 7 日間、新規エントリーを停止
+
 # ---------- Symbol Score Weights ----------
 score:
   w_slope: 0.6
@@ -258,6 +327,14 @@ shadow:
   commission_bps: 10.0       # 片道手数料
   initial_equity: 100000.0   # シャドーの仮想資金（サイズ計算用）
   cooldown_bars: 0           # 0 = position.cooldown/entry.cooldown_bars に従う
+
+# ---------- 実板ペーパー（exchange.env: paper） ----------
+# 本番の公開エンドポイント（api.binance.com、認証不要）から足と板を取り、
+# 実際の板の厚みを消費して約定価格・スリッページを決める。実注文は出さない。
+paper:
+  initial_equity: 100000.0        # 模擬口座の初期資金（quote 建て）
+  fallback_slippage_bps: 5.0      # 板が取れないときの片道スリッページ
+  account_file: data/paper/paper_account.json   # 仮想口座（再起動で維持）
 
 # ---------- Signal-time order book snapshot (MS6 Step3) ----------
 orderbook:

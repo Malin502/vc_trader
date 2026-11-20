@@ -1,0 +1,42 @@
+[Unit]
+Description=AIVC Trade - 実板ペーパー（本番公開データ + 模擬約定）
+Documentation=file:/opt/aivc_trade/doc/paper_deploy/RUNBOOK.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aivc
+Group=aivc
+WorkingDirectory=/opt/aivc_trade
+# 実板ペーパーは公開エンドポイントしか使わないため、API キーは不要。
+# EnvironmentFile は通知先（Discord Webhook）だけを持つ任意ファイル。
+# Testnet の資格情報ファイル（.env.testnet）は配置しない。
+EnvironmentFile=-/opt/aivc_trade/.env.paper
+Environment=AIVC_EXCHANGE_ENV=paper
+Environment=AIVC_CONFIG_PATH=/opt/aivc_trade/config.paper.yaml
+Environment=PYTHONUNBUFFERED=1
+
+# 起動前チェック: paper 以外・公開エンドポイント不達ならここで止まる。
+# ExecStartPre が non-zero を返すと ExecStart は実行されない。
+ExecStartPre=/opt/aivc_trade/.venv/bin/python /opt/aivc_trade/preflight_paper.py --config /opt/aivc_trade/config.paper.yaml
+ExecStart=/opt/aivc_trade/.venv/bin/python /opt/aivc_trade/aivc_trade/main_live.py
+
+# SIGTERM は「イテレーションの切れ目で状態保存して終了」に使う。SIGKILL は避ける。
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=90
+
+Restart=on-failure
+RestartSec=30
+
+# ログは loguru が logs/ にも書く。journald 側はここで確認。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aivc-paper
+
+# 誤って本番 config を指しても、env 側で paper を強制している
+# （AIVC_EXCHANGE_ENV=paper）。paper は発注経路を持たない。
+
+[Install]
+WantedBy=multi-user.target

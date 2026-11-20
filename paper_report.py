@@ -29,14 +29,14 @@ import os
 import statistics
 import sys
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aivc_trade.config.loader import load_config  # noqa: E402
-from aivc_trade.ops.signal_journal import SignalJournal  # noqa: E402
+from aivc_trade.ops.signal_journal import EVENT_CONFIG, EVENT_GATE, SignalJournal  # noqa: E402
 
 #: 停止条件（仕様 v2 改訂 2026-11-20）
 MATCH_RATE_STOP_PCT = 90.0
@@ -92,6 +92,84 @@ def _round(value: Optional[float], digits: int = 2) -> Optional[float]:
     return None if value is None else round(float(value), digits)
 
 
+def _config_timeline(configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """CONFIG レコードを「構成が有効だった区間」に変換する。
+
+    起動ごとに 1 行残るので、隣の CONFIG の ts までがその構成の区間。
+    最後の 1 件は ``to=None``（＝レポート時点まで）。
+    """
+    ordered = sorted(
+        (c for c in configs if (c.get("event") or "") == EVENT_CONFIG),
+        key=lambda c: _parse_ts(c.get("ts")) or datetime.min.replace(tzinfo=timezone.utc),
+    )
+    out: List[Dict[str, Any]] = []
+    for i, c in enumerate(ordered):
+        nxt = ordered[i + 1] if i + 1 < len(ordered) else None
+        g3 = (c.get("htf_gate") or {}).get("g3") or {}
+        w2 = c.get("whipsaw_w2") or {}
+        out.append(
+            {
+                "from": c.get("ts"),
+                "to": nxt.get("ts") if nxt else None,
+                "config_id": c.get("config_id"),
+                "components": list(c.get("enabled_components") or []),
+                "entry_mode": c.get("entry_mode"),
+                "exchange_env": c.get("exchange_env"),
+                "g3_fail_closed": g3.get("fail_closed"),
+                # W2 の履歴不足ポリシー（v2 スナップショット。v1 のジャーナルは None）
+                "w2_insufficient_history": w2.get("on_insufficient_history"),
+                "code_revision": c.get("code_revision"),
+                "config_path": c.get("config_path"),
+            }
+        )
+    return out
+
+
+def _gate_summary(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """GATE レコード（G3 の状態変化）の集計。fail-closed の作動回数を数える。"""
+    gates = [r for r in records if (r.get("event") or "") == EVENT_GATE]
+    data_unavailable = [
+        g for g in gates
+        if str(g.get("reason") or "").startswith("data_unavailable")
+    ]
+    blocked = [g for g in gates if g.get("blocked")]
+    last = gates[-1] if gates else None
+    return {
+        "records": len(gates),
+        "blocked_records": len(blocked),
+        "data_unavailable_records": len(data_unavailable),
+        "last": {
+            "ts": last.get("ts"),
+            "blocked": last.get("blocked"),
+            "ok": last.get("ok"),
+            "reason": last.get("reason"),
+        }
+        if last
+        else None,
+    }
+
+
+def _config_records(
+    records: List[Dict[str, Any]], date: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """CONFIG レコードを返す（``--date`` ならその日以前に起動した分だけ）。
+
+    構成スナップショットは期間フィルタの外から拾う。その日に始まったわけでは
+    ない起動でも「その日有効だった構成」として出す必要があるため。
+    """
+    out = [r for r in records if (r.get("event") or "") == EVENT_CONFIG]
+    if date:
+        cutoff = _parse_ts(date)
+        if cutoff is not None:
+            cutoff = cutoff + timedelta(days=1)
+            out = [
+                c for c in out
+                if (_parse_ts(c.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
+                < cutoff
+            ]
+    return out
+
+
 # ----------------------------------------------------------------------
 # aggregation
 # ----------------------------------------------------------------------
@@ -100,6 +178,7 @@ def summarize(
     *,
     backtest_signals: Optional[List[Dict[str, Any]]] = None,
     s1_slippage_bps: Optional[float] = None,
+    config_snapshots: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Aggregate journal records into the paper-run metrics."""
     signals = [r for r in records if (r.get("event") or "SIGNAL") == "SIGNAL"]
@@ -197,12 +276,23 @@ def summarize(
                 f"worst {_round(max(over))}bps)"
             )
 
+    config_source = list(config_snapshots) if config_snapshots is not None else list(records)
+    config_timeline = _config_timeline(config_source)
+
     return {
         "period": {
             "first": min((str(r.get("ts")) for r in records), default=None),
             "last": max((str(r.get("ts")) for r in records), default=None),
             "records": len(records),
         },
+        "config": {
+            "snapshots": sum(
+                1 for r in config_source if (r.get("event") or "") == EVENT_CONFIG
+            ),
+            "current": config_timeline[-1] if config_timeline else None,
+            "history": config_timeline,
+        },
+        "gate": _gate_summary(records),
         "signals": {
             "count": len(signals),
             "distinct_bars": len(bars),
@@ -285,6 +375,35 @@ def render(summary: Dict[str, Any]) -> str:
     lines.append("=== ペーパー評価レポート ===")
     lines.append(f"期間: {period['first']} .. {period['last']} ({period['records']} records)")
     lines.append("")
+    # --- 構成（どの期間に何が有効だったか） -----------------------------
+    cfg_info = summary.get("config") or {}
+    cur = cfg_info.get("current")
+    if cur:
+        comps = ",".join(cur.get("components") or []) or "none"
+        lines.append(
+            f"[構成] 起動時スナップショット {cfg_info.get('snapshots', 0)} 件 / "
+            f"現在 id={cur.get('config_id')} 構成={comps} env={cur.get('exchange_env')} "
+            f"entry={cur.get('entry_mode')} g3_fail_closed={cur.get('g3_fail_closed')} "
+            f"w2_insufficient_history={cur.get('w2_insufficient_history')} "
+            f"rev={cur.get('code_revision')}"
+        )
+        for h in cfg_info.get("history", [])[-3:]:
+            lines.append(
+                f"  {h.get('from')} .. {h.get('to') or '現在'}: "
+                f"id={h.get('config_id')} 構成={','.join(h.get('components') or []) or 'none'}"
+            )
+    else:
+        lines.append("[構成] 起動時スナップショット未記録（このイベント導入前のジャーナル）")
+    gate = summary.get("gate") or {}
+    if gate.get("records"):
+        last = gate.get("last") or {}
+        lines.append(
+            f"[G3] 状態変化 {gate['records']} 件 / blocked {gate.get('blocked_records', 0)} 件 / "
+            f"data_unavailable {gate.get('data_unavailable_records', 0)} 件"
+        )
+        if last.get("reason"):
+            lines.append(f"  最新: {last.get('ts')} blocked={last.get('blocked')} {last.get('reason')}")
+    lines.append("")
     lines.append(f"[シグナル] {s['count']} 件 / 判定バー {s['distinct_bars']} 本"
                  f" (bar_ts 欠落 {s['missing_bar_ts']})")
     if s["by_symbol"]:
@@ -354,16 +473,25 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     cfg = load_config()
     journal_path = args.journal or cfg["persistence"]["signal_journal_path"]
-    records = SignalJournal.load(journal_path)
+    records_all = SignalJournal.load(journal_path)
+
+    # 構成スナップショットは期間フィルタの外から拾う（その日に始まったわけでは
+    # ない起動でも「その日有効だった構成」として出す必要がある）。
+    configs_all = _config_records(records_all, date=args.date)
 
     since = _parse_ts(args.since) if args.since else None
-    records = _filter_period(records, date=args.date, since=since)
+    records = _filter_period(records_all, date=args.date, since=since)
     s1 = args.s1_slippage_bps
     if s1 is None:
         s1 = float(cfg.get("costs", {}).get("slippage_bps", 0.0) or 0.0) or None
 
     backtest = load_backtest_signals(args.backtest_signals) if args.backtest_signals else None
-    summary = summarize(records, backtest_signals=backtest, s1_slippage_bps=s1)
+    summary = summarize(
+        records,
+        backtest_signals=backtest,
+        s1_slippage_bps=s1,
+        config_snapshots=configs_all,
+    )
     summary["journal"] = str(journal_path)
 
     if args.json:

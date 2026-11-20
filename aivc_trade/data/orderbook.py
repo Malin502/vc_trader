@@ -118,6 +118,103 @@ def summarize_depth(
     return out
 
 
+def simulate_market_fill(
+    depth: Dict[str, Any],
+    side: str,
+    qty: float,
+    *,
+    fallback_price: Optional[float] = None,
+    fallback_slippage_bps: float = 0.0,
+) -> Dict[str, Any]:
+    """成行注文を板の厚みで約定させる（実板ペーパーの模擬約定）.
+
+    ``depth`` は ``/api/v3/depth`` の生ペイロード（:meth:`OrderBookRecorder.snapshot`
+    と同じ取得経路）。BUY は asks を、SELL は bids を安い/高い方から消費し、
+    消費した数量の加重平均を約定価格にする。板が薄く ``qty`` を満たせない場合は
+    最良レベル（最後に消費した価格）で残りを埋め、``shortfall_qty`` に残す
+    （＝実運用では成行が板を食い切る場面。レポートで検証できるよう事実を残す）。
+
+    板が取れていない / 片側が空のときは ``fallback_price``（通常は現在値）に
+    ``fallback_slippage_bps`` を不利方向へ足した価格で全量約定とみなす。
+    この場合 ``source`` は ``ticker_fallback`` になる。
+    """
+    side = str(side).upper()
+    if side not in ("BUY", "SELL"):
+        raise ValueError(f"Unsupported side: {side!r}")
+    qty = float(qty)
+    if qty <= 0:
+        raise ValueError(f"qty must be > 0, got {qty}")
+
+    raw = (depth or {}).get("asks" if side == "BUY" else "bids") or []
+    levels = _levels(raw)
+    best = levels[0][0] if levels else None
+    other = _levels((depth or {}).get("bids" if side == "BUY" else "asks") or [])
+    mid = ((best + other[0][0]) / 2.0) if (best and other) else None
+
+    remaining = qty
+    notional = 0.0
+    filled = 0.0
+    consumed = 0
+    shortfall = 0.0
+    for price, available in levels:
+        if price <= 0 or available <= 0:
+            continue
+        take = min(remaining, available)
+        notional += take * price
+        filled += take
+        remaining -= take
+        consumed += 1
+        if remaining <= 1e-12:
+            break
+
+    if filled <= 0:
+        if fallback_price is None or float(fallback_price) <= 0:
+            return {
+                "ok": False,
+                "reason": "empty book and no fallback price",
+                "side": side,
+                "filled_qty": 0.0,
+                "notional": 0.0,
+                "avg_price": None,
+                "levels_consumed": 0,
+                "shortfall_qty": qty,
+                "source": "none",
+            }
+        slip = float(fallback_price) * float(fallback_slippage_bps) / 10_000.0
+        price = float(fallback_price) + (slip if side == "BUY" else -slip)
+        return {
+            "ok": True,
+            "side": side,
+            "filled_qty": qty,
+            "notional": price * qty,
+            "avg_price": price,
+            "levels_consumed": 0,
+            "shortfall_qty": 0.0,
+            "source": "ticker_fallback",
+        }
+
+    if remaining > 1e-12:
+        # 板を食い切った: 最後のレベルで残りを埋める（実運用ではさらに不利に滑る）。
+        last_price = levels[consumed - 1][0]
+        notional += remaining * last_price
+        filled += remaining
+        shortfall = remaining
+        remaining = 0.0
+
+    return {
+        "ok": True,
+        "side": side,
+        "filled_qty": filled,
+        "notional": notional,
+        "avg_price": notional / filled,
+        "levels_consumed": consumed,
+        "shortfall_qty": shortfall,
+        "best_price": best,
+        "mid": mid,
+        "source": "book",
+    }
+
+
 class OrderBookRecorder:
     """Fetch and persist the order book at signal time.
 

@@ -43,6 +43,8 @@ log = get_logger("signal_journal")
 EVENT_SIGNAL = "SIGNAL"
 EVENT_FILL = "FILL"
 EVENT_STOP = "STOP"
+EVENT_GATE = "GATE"
+EVENT_CONFIG = "CONFIG"
 
 
 def _iso(ts: datetime) -> str:
@@ -53,6 +55,35 @@ def _iso(ts: datetime) -> str:
 
 def _side_value(side: Any) -> str:
     return getattr(side, "value", str(side))
+
+
+def gate_record(
+    status: Dict[str, Any],
+    *,
+    ts: Optional[datetime] = None,
+    mode: str = "live",
+    level: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """GATE レコードを組み立てる（G3 / W2 共通の形）.
+
+    ``status`` は ``GateStatus.as_dict()`` / ``W2Status.as_dict()`` の戻り値
+    （``gate`` / ``enabled`` / ``blocked`` / ``ok`` / ``state`` / ``reason`` /
+    ``symbol`` など）。``ok=False``（判定不能・データ失敗）は ``level=WARNING``。
+
+    ライブの ``SignalJournal.record_gate`` もシャドーのブロック記録も同じ関数を
+    通すので、**同じ形**で読める（ジャーナルを跨いだ集計ができる）。
+    """
+    record: Dict[str, Any] = {
+        "event": EVENT_GATE,
+        "ts": _iso(ts or datetime.now(timezone.utc)),
+        "mode": str(mode),
+        "level": level or ("INFO" if status.get("ok") else "WARNING"),
+    }
+    record.update(status)
+    if extra:
+        record.update(extra)
+    return record
 
 
 def slippage_bps(price: float, expected: float, side: str = "BUY") -> Optional[float]:
@@ -76,10 +107,20 @@ class SignalJournal:
         mode: str = "live",
         *,
         enabled: bool = True,
+        defaults: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.path = Path(path)
         self.mode = str(mode)
         self.enabled = bool(enabled)
+        #: 全レコードに付ける既定フィールド（実板ペーパーは ``venue=paper_mock``）。
+        #: 約定が模擬であることを後から機械的に見分けるために使う。
+        self.defaults: Dict[str, Any] = dict(defaults or {})
+
+    def _stamp(self, record: Dict[str, Any], extra: Optional[Dict[str, Any]]) -> None:
+        for key, value in self.defaults.items():
+            record.setdefault(key, value)
+        if extra:
+            record.update(extra)
 
     # ------------------------------------------------------------------
     # SIGNAL
@@ -120,8 +161,7 @@ class SignalJournal:
             "stop_price": float(signal.stop_price),
             "orderbook": orderbook,
         }
-        if extra:
-            record.update(extra)
+        self._stamp(record, extra)
 
         self.append(record)
         return record
@@ -166,8 +206,7 @@ class SignalJournal:
             "fee_asset": str(fee_asset or ""),
             "order_id": str(order_id) if order_id else None,
         }
-        if extra:
-            record.update(extra)
+        self._stamp(record, extra)
         self.append(record)
         return record
 
@@ -207,8 +246,53 @@ class SignalJournal:
             "order_id": str(order_id) if order_id else None,
             "detail": detail,
         }
-        if extra:
-            record.update(extra)
+        self._stamp(record, extra)
+        self.append(record)
+        return record
+
+    # ------------------------------------------------------------------
+    # GATE (高時間軸ゲート G3 の状態変化 / 判定不能の警告)
+    # ------------------------------------------------------------------
+    def record_gate(
+        self,
+        status: Dict[str, Any],
+        *,
+        ts: Optional[datetime] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record a G3 state change. ``ok=False`` は「判定不能」。
+
+        live の fail-closed では ``ok=False`` かつ ``blocked=True``
+        （``reason`` が ``data_unavailable: ...``）になり、新規エントリーは止まる。
+        """
+        record = gate_record(status, ts=ts, mode=self.mode)
+        self._stamp(record, extra)
+        self.append(record)
+        return record
+
+    # ------------------------------------------------------------------
+    # CONFIG (起動時の構成スナップショット = 期間ごとの構成の再構成用)
+    # ------------------------------------------------------------------
+    def record_config(
+        self,
+        snapshot: Dict[str, Any],
+        *,
+        ts: Optional[datetime] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Record the configuration a run started with (``event: CONFIG``).
+
+        有効なゲート（G3 のみ / G3+W2 等）と版を起動ごとに 1 行残す。ジャーナル
+        上の隣接する CONFIG レコードの区間が、その構成で走っていた期間になる。
+        """
+        record: Dict[str, Any] = {
+            "event": EVENT_CONFIG,
+            "ts": _iso(ts or datetime.now(timezone.utc)),
+            "mode": self.mode,
+            "level": "INFO",
+        }
+        record.update(snapshot)
+        self._stamp(record, extra)
         self.append(record)
         return record
 
