@@ -10,6 +10,7 @@ import pandas as pd
 from aivc_trade.core.types import Position, Regime, Side, Signal
 from aivc_trade.core.logger import get_logger
 from aivc_trade.strategy.gates import gate_block_reason
+from aivc_trade.strategy.whipsaw import whipsaw_block_reason
 
 log = get_logger("signal")
 
@@ -341,6 +342,12 @@ def generate_signals(
         blocked_by = gate_block_reason(row, cfg)
         if blocked_by is not None:
             log.debug(f"{symbol} blocked by daily gate {blocked_by}")
+            continue
+
+        # --- Gate 1.6: W2（高ボラ期間の間引き） ---
+        # 既定は無効。W1（サイズ半減）はサイジング側で効くのでここでは見ない。
+        if whipsaw_block_reason(row, cfg) is not None:
+            log.debug(f"{symbol} blocked by whipsaw W2 (high volatility)")
             continue
 
         # --- Gate 2: Cooldown (bar-based or time-based) ---

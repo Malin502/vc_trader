@@ -35,6 +35,13 @@ from aivc_trade.strategy.gates import (
 from aivc_trade.strategy.regime import classify_regime, apply_regime_hysteresis
 from aivc_trade.strategy.signal import generate_signals
 from aivc_trade.strategy.sizing import compute_qty
+from aivc_trade.strategy.whipsaw import (
+    StopStreakBrake,
+    add_whipsaw_columns,
+    build_vol_frames,
+    risk_scale_for_row,
+    vol_columns_enabled,
+)
 from aivc_trade.execution.position_manager import PositionManager
 
 log = get_logger("simulator")
@@ -66,6 +73,9 @@ class Simulator:
             cfg["position"].get("regime_exit_cooldown_hours",
                                 cfg["position"].get("cooldown_hours", 6))
         )
+        # W3（ストップ連敗ブレーキ）。既定は無効。監査用の診断もここに残す。
+        self.whipsaw_brake = StopStreakBrake(cfg)
+        self.diagnostics: Dict[str, Any] = {}
 
     def run(
         self,
@@ -112,6 +122,15 @@ class Simulator:
             add_daily_gates(feat_1h, daily, self.cfg)
             log.info(f"daily gates enabled: {enabled_gates(self.cfg)}")
 
+        # --- W1/W2: 銘柄ごとの日足実現ボラと過去 1 年分位（既定は無効） ---
+        # 無効時は集計もしない＝現行挙動と同一。
+        if vol_columns_enabled(self.cfg):
+            vol = build_vol_frames(candles_1h, self.cfg)
+            add_whipsaw_columns(feat_1h, vol, self.cfg)
+            log.info("whipsaw volatility columns enabled (w1=%s, w2=%s)",
+                     bool((self.cfg.get("whipsaw", {}).get("w1") or {}).get("enabled")),
+                     bool((self.cfg.get("whipsaw", {}).get("w2") or {}).get("enabled")))
+
         # --- Build unified 1h timeline ---
         all_ts = set()
         for df in feat_1h.values():
@@ -143,6 +162,7 @@ class Simulator:
         loss_streak: Dict[str, int] = {}    # {symbol: consecutive_losses}
         trades: List[TradeRecord] = []
         equity_records: List[Dict[str, Any]] = []
+        brake_blocked_bars = 0
 
         # Pre-index 5m data for quick lookup
         _5m_idx = {}
@@ -188,28 +208,35 @@ class Simulator:
                     cooldowns_bar[sym] = PositionManager.compute_cooldown_bars(
                         i, self.cooldown_bars, streak
                     )
+                    # W3: STOP_LOSS の決済だけをブレーキに数える（部分利確は数えない）
+                    self.whipsaw_brake.record(ts, emitted[-1].exit_reason)
                     del positions[sym]
                     entry_bar_idx.pop(sym, None)
 
             # --- Entries: fill every free slot, best score first ---
             if len(positions) < max_concurrent:
-                signals = generate_signals(
-                    feat_at, {}, self.cfg, ts,
-                    current_positions=list(positions.values()),
-                    cooldowns_bar=cooldowns_bar,
-                    current_bar_idx=i,
-                )
-                for best in signals:
-                    if len(positions) >= max_concurrent:
-                        break
-                    if best.symbol in positions:
-                        continue  # 同一銘柄ガード（live と同じ belt-and-braces）
-                    opened = self._open_position(best, feat_at, feat_1h, ts, equity)
-                    if opened is None:
-                        continue
-                    positions[best.symbol] = opened
-                    entry_bar_idx[best.symbol] = i
-                    equity -= opened.entry_cost
+                if self.whipsaw_brake.blocks(ts):
+                    # W3: 停止期間中は新規エントリーしない（保有玉の管理は継続）
+                    brake_blocked_bars += 1
+                    log.debug("W3 stop-streak brake active – no new entries")
+                else:
+                    signals = generate_signals(
+                        feat_at, {}, self.cfg, ts,
+                        current_positions=list(positions.values()),
+                        cooldowns_bar=cooldowns_bar,
+                        current_bar_idx=i,
+                    )
+                    for best in signals:
+                        if len(positions) >= max_concurrent:
+                            break
+                        if best.symbol in positions:
+                            continue  # 同一銘柄ガード（live と同じ belt-and-braces）
+                        opened = self._open_position(best, feat_at, feat_1h, ts, equity)
+                        if opened is None:
+                            continue
+                        positions[best.symbol] = opened
+                        entry_bar_idx[best.symbol] = i
+                        equity -= opened.entry_cost
 
             # --- Equity snapshot (realised + unrealised of every open position) ---
             mark_equity = equity
@@ -234,6 +261,11 @@ class Simulator:
             equity += trade.pnl
 
         equity_df = pd.DataFrame(equity_records)
+        # W3 の監査情報（評価スクリプトが読む）。無効時は halt_count=0。
+        self.diagnostics = {
+            "w3": self.whipsaw_brake.stats(),
+            "w3_blocked_bars": int(brake_blocked_bars),
+        }
         log.info(
             f"Backtest done: {len(trades)} trades, "
             f"final equity={equity:.2f}"
@@ -321,11 +353,16 @@ class Simulator:
             signal.stop_price = entry_price * 0.95  # fallback
 
         lot_step, min_qty, min_notional = self._lot_params(signal.symbol)
+        # W1: 高ボラ期間は 1 トレードのリスクを半分にする（既定は倍率 1.0）。
+        risk_scale = 1.0
+        if signal.symbol in feat_at and not feat_at[signal.symbol].empty:
+            risk_scale = risk_scale_for_row(feat_at[signal.symbol].iloc[-1], self.cfg)
         qty = compute_qty(
             signal, equity, self.cfg,
             lot_step=lot_step,
             min_qty=min_qty,
             min_notional=min_notional,
+            risk_scale=risk_scale,
         )
         if qty <= 0:
             return None

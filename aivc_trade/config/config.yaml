@@ -214,6 +214,29 @@ gates:
     enabled: false          # 参照銘柄（BTC）の日足終値 < SMA200 → 全銘柄で新規エントリーしない
     reference: BTC
 
+# ---------- Whipsaw 対策 W1〜W3（Step 2b / 事前登録 2026-11-20 追補） ----------
+# 2021 型（タイミングの誤り）への手当て。既定は全て無効＝現行挙動。
+# 指標は日足リターンの 30 日標準偏差と、その過去 1 年（365 日）分位点。
+# 参照するのは「エントリー日の前日までの確定日足」だけ（先読みなし）。
+# パーセンタイル分布が未確定（履歴不足）の期間はゲートしない。
+whipsaw:
+  w1:
+    enabled: false          # ボラ連動サイズ: rv30 > 過去1年 80%tile → リスク半減
+    vol_window_days: 30
+    ref_window_days: 365
+    percentile: 0.80
+    risk_scale: 0.5         # 高ボラ期間のリスク倍率（1 トレードのリスクを半分）
+  w2:
+    enabled: false          # ボラ連動の間引き: rv30 > 過去1年 90%tile → 新規エントリーしない
+    vol_window_days: 30
+    ref_window_days: 365
+    percentile: 0.90
+  w3:
+    enabled: false          # ストップ連敗ブレーキ（全銘柄共通）
+    stop_window_days: 14    # この期間内の STOP_LOSS 件数を見る
+    stop_count: 3           # 3 件に達したら
+    halt_days: 7            # 7 日間、新規エントリーを停止
+
 # ---------- Symbol Score Weights ----------
 score:
   w_slope: 0.6

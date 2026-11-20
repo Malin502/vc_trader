@@ -163,6 +163,7 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     _validate_drawdown(cfg)
     _validate_shadow(cfg)
     _validate_orderbook(cfg)
+    _validate_whipsaw(cfg)
 
     risk_cfg = cfg.get("risk", {})
     initial_sl = risk_cfg.get("initial_sl", {})
@@ -421,3 +422,53 @@ def _validate_orderbook(cfg: Dict[str, Any]) -> None:
     timeout = float(ob.get("timeout_s", 5.0))
     if timeout <= 0:
         raise ValueError("Invalid config: orderbook.timeout_s must be > 0")
+
+
+def _validate_whipsaw(cfg: Dict[str, Any]) -> None:
+    """Whipsaw 対策 W1〜W3（Step 2b）の設定値.
+
+    事前登録で固定した値（30/365/0.80/0.90・14日3件7日）を config で
+    上書きできる形にしてあるが、値の妥当性だけは検査する（閾値探索は禁止）。
+    """
+    ws = cfg.get("whipsaw") or {}
+    if not ws:
+        return
+
+    for key in ("w1", "w2"):
+        sec = ws.get(key) or {}
+        if not sec:
+            continue
+        for name in ("vol_window_days", "ref_window_days"):
+            value = int(sec.get(name, 1))
+            if value < 2:
+                raise ValueError(f"Invalid config: whipsaw.{key}.{name} must be >= 2")
+        if int(sec.get("vol_window_days", 30)) > int(sec.get("ref_window_days", 365)):
+            raise ValueError(
+                f"Invalid config: whipsaw.{key}.vol_window_days must be <= ref_window_days"
+            )
+        q = float(sec.get("percentile", 0.5))
+        if not (0.0 < q < 1.0):
+            raise ValueError(
+                f"Invalid config: whipsaw.{key}.percentile must satisfy 0 < x < 1, got {q}"
+            )
+
+    w1 = ws.get("w1") or {}
+    if w1:
+        scale = float(w1.get("risk_scale", 1.0))
+        if not (0.0 < scale <= 1.0):
+            raise ValueError(
+                "Invalid config: whipsaw.w1.risk_scale must satisfy 0 < x <= 1, "
+                f"got {scale}"
+            )
+
+    w3 = ws.get("w3") or {}
+    if w3:
+        window = int(w3.get("stop_window_days", 14))
+        count = int(w3.get("stop_count", 3))
+        halt = int(w3.get("halt_days", 7))
+        if window < 1:
+            raise ValueError("Invalid config: whipsaw.w3.stop_window_days must be >= 1")
+        if count < 1:
+            raise ValueError("Invalid config: whipsaw.w3.stop_count must be >= 1")
+        if halt < 1:
+            raise ValueError("Invalid config: whipsaw.w3.halt_days must be >= 1")
