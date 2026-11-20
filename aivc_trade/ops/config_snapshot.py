@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 #: スナップショットの形式版。フィールドを増やすときは上げる。
-CONFIG_SNAPSHOT_VERSION = 1
+#: v2 – ``whipsaw_w2``（有効状態＋履歴不足ポリシー）を追加（W2 live 結線 2026-11-20）。
+CONFIG_SNAPSHOT_VERSION = 2
 
 
 def _enabled(flag: Any) -> bool:
@@ -93,6 +94,14 @@ def build_config_snapshot(
         "whipsaw": {
             key: _enabled(whipsaw.get(key)) for key in ("w1", "w2", "w3")
         },
+        # W2 の live 結線で意味が変わるのは「履歴不足を止めるか」だけなので、
+        # 有効状態と合わせて記録する（GATE ジャーナルの reason にも policy が出る）。
+        "whipsaw_w2": {
+            "enabled": _enabled(whipsaw.get("w2")),
+            "on_insufficient_history": str(
+                (whipsaw.get("w2") or {}).get("on_insufficient_history", "pass")
+            ),
+        },
         "code_revision": revision if revision is not None else code_revision(),
         "config_path": config_path or os.environ.get("AIVC_CONFIG_PATH") or None,
     }
@@ -127,6 +136,7 @@ def _config_id(snapshot: Dict[str, Any]) -> str:
         "htf_gate",
         "backtest_gates",
         "whipsaw",
+        "whipsaw_w2",
     )
     material = {k: snapshot.get(k) for k in keys}
     blob = json.dumps(material, sort_keys=True, ensure_ascii=False, default=str)

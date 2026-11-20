@@ -11,6 +11,7 @@ from aivc_trade.core.types import Position, Regime, Side, Signal
 from aivc_trade.core.logger import get_logger
 from aivc_trade.strategy.gates import gate_block_reason
 from aivc_trade.strategy.whipsaw import whipsaw_block_reason
+from aivc_trade.strategy.whipsaw_live import w2_block_reason
 
 log = get_logger("signal")
 
@@ -268,6 +269,7 @@ def generate_signals(
     cooldowns_bar: Optional[Dict[str, int]] = None,
     current_bar_idx: int = 0,
     htf_gate: Optional[Any] = None,
+    vol_gate: Optional[Dict[str, Any]] = None,
 ) -> List[Signal]:
     """Evaluate entry conditions for each symbol and return candidate signals.
 
@@ -291,6 +293,10 @@ def generate_signals(
     htf_gate : live / shadow の G3 状態（``strategy.htf_gate.GateStatus``）。
         ``blocked`` なら全銘柄で新規なし。``None`` はゲート評価なし
         （バックテストは日足判定列 ``gate_g3_ok`` を使うのでここには来ない）。
+    vol_gate : live / shadow の W2 状態（``{symbol: strategy.whipsaw_live.W2Status}``）。
+        銘柄ごとに ``blocked`` ならその銘柄の新規なし。``None`` は W2 を評価して
+        いない（バックテストは特徴量の列 ``w2_ok`` で判定する）。
+        dict に銘柄が無い場合は停止（fail-safe、評価側の「列が無い」と同じ）。
 
     Returns
     -------
@@ -356,10 +362,19 @@ def generate_signals(
             log.debug(f"{symbol} blocked by daily gate {blocked_by}")
             continue
 
-        # --- Gate 1.6: W2（高ボラ期間の間引き） ---
+        # --- Gate 1.6: W2（高ボラ期間の間引き、銘柄ごと） ---
         # 既定は無効。W1（サイズ半減）はサイジング側で効くのでここでは見ない。
-        if whipsaw_block_reason(row, cfg) is not None:
-            log.debug(f"{symbol} blocked by whipsaw W2 (high volatility)")
+        #   live / shadow : 日足から評価した ``vol_gate``（W2Status）で判定する。
+        #   backtest      : 特徴量の列 ``w2_ok``（add_whipsaw_columns）で判定する。
+        # 両方を同時に見ると live では列が無い＝全銘柄停止になるため、
+        # vol_gate が渡されたときは列側は見ない（意味論は同じ）。
+        w2_reason = (
+            w2_block_reason(symbol, vol_gate)
+            if vol_gate is not None
+            else whipsaw_block_reason(row, cfg)
+        )
+        if w2_reason is not None:
+            log.debug(f"{symbol} blocked by W2: {w2_reason}")
             continue
 
         # --- Gate 2: Cooldown (bar-based or time-based) ---

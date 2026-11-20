@@ -501,6 +501,24 @@ def _validate_whipsaw(cfg: Dict[str, Any]) -> None:
                 f"got {scale}"
             )
 
+    # W2 の live 結線（2026-11-20）: 取得は 1 回の日足 API 呼び出しに収める必要が
+    # ある（G3 と共通の DailyBarCache）。Binance の 1 回上限は 1000 本。
+    w2 = ws.get("w2") or {}
+    if w2:
+        window = int(w2.get("vol_window_days", 30))
+        ref = int(w2.get("ref_window_days", 365))
+        if window + ref > 900:
+            raise ValueError(
+                "Invalid config: whipsaw.w2 needs vol_window_days + ref_window_days <= 900 "
+                f"(single daily fetch, Binance limit 1000), got {window + ref}"
+            )
+        policy = str(w2.get("on_insufficient_history", "pass"))
+        if policy not in ("pass", "block"):
+            raise ValueError(
+                "Invalid config: whipsaw.w2.on_insufficient_history must be pass|block, "
+                f"got {policy}"
+            )
+
     w3 = ws.get("w3") or {}
     if w3:
         window = int(w3.get("stop_window_days", 14))

@@ -106,6 +106,7 @@ def _config_timeline(configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for i, c in enumerate(ordered):
         nxt = ordered[i + 1] if i + 1 < len(ordered) else None
         g3 = (c.get("htf_gate") or {}).get("g3") or {}
+        w2 = c.get("whipsaw_w2") or {}
         out.append(
             {
                 "from": c.get("ts"),
@@ -115,6 +116,8 @@ def _config_timeline(configs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 "entry_mode": c.get("entry_mode"),
                 "exchange_env": c.get("exchange_env"),
                 "g3_fail_closed": g3.get("fail_closed"),
+                # W2 の履歴不足ポリシー（v2 スナップショット。v1 のジャーナルは None）
+                "w2_insufficient_history": w2.get("on_insufficient_history"),
                 "code_revision": c.get("code_revision"),
                 "config_path": c.get("config_path"),
             }
@@ -381,6 +384,7 @@ def render(summary: Dict[str, Any]) -> str:
             f"[構成] 起動時スナップショット {cfg_info.get('snapshots', 0)} 件 / "
             f"現在 id={cur.get('config_id')} 構成={comps} env={cur.get('exchange_env')} "
             f"entry={cur.get('entry_mode')} g3_fail_closed={cur.get('g3_fail_closed')} "
+            f"w2_insufficient_history={cur.get('w2_insufficient_history')} "
             f"rev={cur.get('code_revision')}"
         )
         for h in cfg_info.get("history", [])[-3:]:

@@ -129,7 +129,7 @@ sudo systemctl stop aivc-paper             # 停止（SIGTERM）
 | `SIGNAL` | シグナル時点の想定価格・STOP・スコア・板・`bar_ts`（1h 足の時刻） |
 | `FILL` | 模擬約定（`kind` = ENTRY / PARTIAL / EXIT）、`expected_price` との `slippage_bps`、手数料 |
 | `STOP` | 模擬 STOP の `PLACED` / `RATCHET` / `RESIZE` / `CANCELLED` / `RECONCILED` / `TRIGGERED` |
-| `GATE` | G3 の状態変化（`blocked` / `ok` / `reason` / 終値・SMA・`bar_ts`）。`ok=false`（判定不能）は `level=WARNING` |
+| `GATE` | G3 / W2 の状態変化（`blocked` / `ok` / `reason` / `bar_ts`、G3 は終値・SMA、W2 は `state`・`rv`・`threshold`・`n_closed`）。`ok=false`（判定不能）は `level=WARNING` |
 | `CONFIG` | **起動時の構成スナップショット**（有効なゲート・`entry.mode`・`fail_closed`・`config_id`・`code_revision`） |
 
 `FILL` には板の消費情報（`levels_consumed` / `shortfall_qty` / `source`）が
@@ -254,3 +254,44 @@ journalctl -u aivc-paper-report --since today
    古い）も同じ扱い。止めた事実は `GATE`（`level=WARNING`）と Discord 通知に残す。
    バックテスト／評価の意味論は変更していない（`tests/test_g3_activation.py` が
    「評価は pass-through / live は blocked」を両方固定している）。
+
+---
+
+## 11. ペーパー構成の完成（2026-11-20）: W2 の live 結線
+
+Step 2b で暫定採用した W2（ボラ連動の間引き）を live / shadow に結線し、
+`config.paper.yaml` で有効化した。ペーパー構成は **「現行＋G3＋W2」** で固定。
+
+1. **W2 の有効化**: `config.paper.yaml` で `whipsaw.w2.enabled: true`。
+   判定は **銘柄ごと**（運用 3 銘柄 + シャドー 4 銘柄）。G3 とは **AND**
+   （G3 が止めれば全銘柄停止、W2 は止めた銘柄だけ停止）。
+   既定 config（`aivc_trade/config/config.yaml`）は `false` のまま。
+
+2. **日足の取得は G3 と共通**（`aivc_trade/data/daily_bars.py` の `DailyBarCache`）。
+   1 銘柄あたり **UTC 1 日 1 回・1 リクエスト**（500 本 = W2 の 395 本 + G3 の 200 本を
+   1 回で賄う。Binance の 1 回上限は 1000）。G3 の `FETCH_LIMIT` も同じ 500 本。
+
+3. **ゲートの原則（裁定 2026-11-20）**:
+
+   > ゲートが止めるのは、リスクの積極証拠（高ボラ）か、データの破損のときだけ。
+   > 証拠の不在はリスクとして扱わない。
+
+   したがって:
+   - **高ボラ**（`rv30 > rv` の直近 365 本の p90、厳密に `>`）→ **止める**
+   - **データ失敗**（無し・列無し・取得失敗・陳腐化・日付の欠け・非有限値）→ **止める**
+     （G3 の fail-closed と同一線。`state=data_error`, `ok=false`）
+   - **履歴不足**（確定日足が 395 本未満 = 上場直後など）→ **止めない**（既定）
+     `whipsaw.w2.on_insufficient_history: pass | block` で切り替え可能
+     （`block` は「証拠が揃うまで建てない」安全側の運用オプション）。
+     既定が `pass` なのは Step 2b 評価実装（履歴不足の期間はゲートしない）に
+     合わせるため。起動時バックフィル（判定開始に終値 395 本）があるため、
+     運用中の 4 銘柄で履歴不足は実質発生しない。
+
+4. **起動時の記録**: `CONFIG` に `whipsaw_w2`（`enabled` と
+   `on_insufficient_history`）が載る（`config_snapshot_version: 2`）。
+   `GATE` は G3 と同じ形式で **銘柄ごと** に `gate=W2` の状態変化を残す
+   （`state` は `open` / `high_vol` / `insufficient_history` / `data_error`）。
+   `paper_report.py` の `[構成]` 行にも `w2_insufficient_history` が出る。
+
+5. **範囲外**: W1（サイズ半減）と W3（ストップ連敗ブレーキ）は live 未結線のまま
+   （`enabled: false`）。評価側の意味論・バックテストには手を入れていない。

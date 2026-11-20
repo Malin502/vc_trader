@@ -1,10 +1,13 @@
 # 実板ペーパー用 config（exchange.env: paper）
 #
 # 運用上の正はこのファイル。`aivc_trade/config/config.yaml` をコピーし、
-# 次の 2 点だけを変えている（他は main と同一に保つ。差分はテストで固定）:
+# 次の 3 点だけを変えている（他は main と同一に保つ。差分はテストで固定）:
 #
-#   exchange.env: paper     … 本番公開データ + 模擬約定（API キーを読まない）
+#   exchange.env: paper       … 本番公開データ + 模擬約定（API キーを読まない）
 #   htf_gate.g3.enabled: true … G3（BTC 日足終値 < SMA200 で新規停止）を有効化
+#   whipsaw.w2.enabled: true  … W2（銘柄ごと rv30 > 過去1年 p90 で新規停止）を有効化
+#
+# ペーパー構成は「現行＋G3＋W2」で固定（裁定 2026-11-20）。
 #
 # 配置先（Nyao VM）: /opt/aivc_trade/config.paper.yaml
 # 手順は doc/paper_deploy/RUNBOOK.md、意図的な逸脱（fail-closed）の説明もそこ。
@@ -261,10 +264,17 @@ whipsaw:
     percentile: 0.80
     risk_scale: 0.5         # 高ボラ期間のリスク倍率（1 トレードのリスクを半分）
   w2:
-    enabled: false          # ボラ連動の間引き: rv30 > 過去1年 90%tile → 新規エントリーしない
+    enabled: true           # 実板ペーパーで W2 を有効化（裁定 2026-11-20、ペーパー構成＝現行＋G3＋W2）
     vol_window_days: 30
     ref_window_days: 365
     percentile: 0.90
+    # 履歴不足（確定日足が 30+365=395 本に満たない＝上場直後など）のあいだ止めるか。
+    #   pass  : ゲートしない（既定。Step 2b 評価実装と同じ意味論）
+    #   block : 履歴が揃うまで止める（安全側の運用オプション）
+    # 原則（裁定 2026-11-20）: ゲートが止めるのは、リスクの積極証拠（高ボラ）か、
+    # データの破損（無し・列無し・取得失敗・陳腐化・欠け）のときだけ。
+    # 証拠の不在はリスクとして扱わない（データ失敗はこの設定に関わらず常に停止）。
+    on_insufficient_history: pass
   w3:
     enabled: false          # ストップ連敗ブレーキ（全銘柄共通）
     stop_window_days: 14    # この期間内の STOP_LOSS 件数を見る

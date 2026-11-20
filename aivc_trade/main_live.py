@@ -37,10 +37,17 @@ from aivc_trade.data.public_client import PublicMarketClient
 from aivc_trade.data.candles_store import CandlesStore
 from aivc_trade.data.feature_engine import compute_features_1h, compute_features_5m
 from aivc_trade.data.orderbook import OrderBookRecorder
+from aivc_trade.data.daily_bars import DailyBarCache
 from aivc_trade.strategy.regime import classify_regime
 from aivc_trade.strategy.gates import daily_gates_enabled
 from aivc_trade.strategy.signal import generate_signals
 from aivc_trade.strategy.htf_gate import G3Tracker, g3_config
+from aivc_trade.strategy.whipsaw_live import (
+    STATE_DATA_ERROR,
+    STATE_INSUFFICIENT,
+    W2Tracker,
+    w2_config,
+)
 from aivc_trade.strategy.sizing import compute_qty, round_down_step
 from aivc_trade.strategy.risk import CircuitBreaker
 from aivc_trade.execution.order_manager import OrderManager
@@ -311,6 +318,11 @@ def main() -> None:
     # **意図的な逸脱（裁定 2026-11-20）**: データ欠損・陳腐化は評価側の
     # pass-through ではなく fail-closed。`data_unavailable` で新規エントリーを
     # 止め、ジャーナル（GATE）と通知に残す（無言の凍結にしない）。
+    #
+    # 日足は G3 / W2 で共有する（銘柄ごとに UTC 1 日 1 回取得）。G3 は BTC だけ、
+    # W2 は運用銘柄ごとなので、同じ銘柄を二重に取りに行かせない。
+    daily_cache = DailyBarCache(client.fetch_klines)
+
     def _on_g3_change(status: Any) -> None:
         signal_journal.record_gate(status.as_dict(), ts=clock.now())
         if not status.ok and status.blocked:
@@ -320,7 +332,7 @@ def main() -> None:
         elif not status.ok:
             notifier.notify_error(f"G3 cannot evaluate (gate open): {status.reason}")
 
-    g3 = G3Tracker(cfg, client.fetch_klines, on_change=_on_g3_change)
+    g3 = G3Tracker(cfg, daily_cache.as_fetch(clock.now), on_change=_on_g3_change)
     if g3.enabled:
         log.info(
             f"G3 enabled: {g3_config(cfg)['symbol']} daily close vs "
@@ -330,6 +342,40 @@ def main() -> None:
     else:
         log.info("G3 disabled (htf_gate.g3.enabled=false)")
     g3.refresh(clock.now(), force=True)
+
+    # --- W2: 銘柄ごとのボラ連動間引き（Step 2b 暫定採用） ---
+    # rv30 が過去 365 本の p90 を **厳密に超える** 銘柄の新規エントリーだけを止める。
+    # ゲートの原則（裁定 2026-11-20）:
+    #   止めるのは「リスクの積極証拠（高ボラ）」か「データの破損（無し・列無し・
+    #   取得失敗・陳腐化・欠け）」のときだけ。証拠の不在（履歴不足）はリスクとして
+    #   扱わない＝既定は pass（評価実装と同じ）。whipsaw.w2.on_insufficient_history
+    #   を block にすると安全側（履歴不足でも止める）に切り替えられる。
+    def _on_w2_change(status: Any) -> None:
+        signal_journal.record_gate(status.as_dict(), ts=clock.now())
+        if status.state == STATE_DATA_ERROR:
+            notifier.notify_error(
+                f"W2 fail-closed ({status.symbol}): new entries stopped ({status.reason})"
+            )
+        elif status.state == STATE_INSUFFICIENT and status.blocked:
+            notifier.notify_error(
+                f"W2 insufficient history ({status.symbol}): new entries stopped "
+                f"({status.reason})"
+            )
+
+    w2 = W2Tracker(
+        cfg, daily_cache.as_fetch(clock.now), symbols, on_change=_on_w2_change
+    )
+    if w2.enabled:
+        w2cfg = w2_config(cfg)
+        log.info(
+            f"W2 enabled: per-symbol rv{w2cfg['vol_window_days']} > "
+            f"p{int(round(w2cfg['percentile'] * 100))} of {w2cfg['ref_window_days']}d "
+            f"(insufficient_history={w2cfg['on_insufficient_history']}, "
+            f"data_error=block, symbols={','.join(symbols)})"
+        )
+    else:
+        log.info("W2 disabled (whipsaw.w2.enabled=false)")
+    w2.refresh(clock.now(), force=True)
     # gates.* はバックテスト専用（1h 足から日足を集計して判定列を付ける）。
     # live は判定列を作らないため、有効なままだと gate_block_reason が
     # 「列が無い＝fail-safe」で全銘柄を止める。事故防止に明示警告する。
@@ -823,6 +869,7 @@ def main() -> None:
                 # G3 は日次（UTC 0:00 以降の最初のループ）で更新。shadow と
                 # 実エントリーが同じバーで同じ判定を使うよう、両者の前に置く。
                 g3.refresh(now)
+                w2.refresh(now)  # 同上（日足は daily_cache で G3 と共有）
                 bar_ts = _ts_floor_1h(now)
                 if bar_ts != last_shadow_bar_ts:
                     last_shadow_bar_ts = bar_ts
@@ -857,6 +904,7 @@ def main() -> None:
                     current_positions=list(positions.values()),
                     cooldowns=cooldowns,
                     htf_gate=g3.status if g3.enabled else None,
+                    vol_gate=w2.statuses if w2.enabled else None,
                 )
                 # MS6 Step3: シグナル時点の板を記録し、シグナルと紐づけて残す。
                 # 実際に発注できたか（entries_blocked / 枠 / 残高）に関わらず記録する

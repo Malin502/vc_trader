@@ -58,6 +58,9 @@ def test_paper_config_enables_g3_and_stays_in_sync_with_main():
     assert paper["exchange"]["env"] == "paper"
     assert paper["htf_gate"]["g3"]["enabled"] is True
     assert paper["htf_gate"]["g3"]["fail_closed"] is True
+    # W2 も実板ペーパーで有効（ペーパー構成＝現行＋G3＋W2、裁定 2026-11-20）
+    assert paper["whipsaw"]["w2"]["enabled"] is True
+    assert paper["whipsaw"]["w2"]["on_insufficient_history"] == "pass"
 
     # 構成の正は main。paper 側で変えてよいのは次だけ（ドリフト防止）。
     diffs = {
@@ -65,7 +68,7 @@ def test_paper_config_enables_g3_and_stays_in_sync_with_main():
         for key in set(_flatten(paper)) | set(_flatten(main))
         if _flatten(paper).get(key) != _flatten(main).get(key)
     }
-    assert diffs == {"exchange.env", "htf_gate.g3.enabled"}
+    assert diffs == {"exchange.env", "htf_gate.g3.enabled", "whipsaw.w2.enabled"}
 
 
 def test_paper_config_loads_through_loader(tmp_path):
@@ -80,18 +83,27 @@ def test_paper_config_loads_through_loader(tmp_path):
 
 def test_config_snapshot_records_enabled_components_only():
     snap = build_config_snapshot(BASE_CFG, revision="abc1234")
-    assert snap["config_snapshot_version"] == 1
+    assert snap["config_snapshot_version"] == 2
     assert snap["enabled_components"] == ["G3"]
     assert snap["htf_gate"]["g3"]["fail_closed"] is True
     assert snap["code_revision"] == "abc1234"
     assert snap["exchange_env"] == "paper"
+    # W2 の履歴不足ポリシーは既定 pass として記録される（v2）
+    assert snap["whipsaw_w2"] == {"enabled": False, "on_insufficient_history": "pass"}
 
     # W2 を足すと構成が変わる＝config_id も変わる（期間の再構成に使える）
     w2 = json.loads(json.dumps(BASE_CFG))
     w2["whipsaw"]["w2"]["enabled"] = True
+    w2["whipsaw"]["w2"]["on_insufficient_history"] = "pass"
     snap_w2 = build_config_snapshot(w2, revision="abc1234")
     assert enabled_components(snap_w2) == ["G3", "W2"]
+    assert snap_w2["whipsaw_w2"] == {"enabled": True, "on_insufficient_history": "pass"}
     assert snap_w2["config_id"] != snap["config_id"]
+
+    # ポリシーだけ変えても構成が変わる（同じ W2 有効でも止め方が違う）
+    w2_block = json.loads(json.dumps(w2))
+    w2_block["whipsaw"]["w2"]["on_insufficient_history"] = "block"
+    assert build_config_snapshot(w2_block, revision="abc1234")["config_id"] != snap_w2["config_id"]
 
     # 同じ構成なら版が違っても同じ config_id（構成の同一性だけを見る）
     assert (

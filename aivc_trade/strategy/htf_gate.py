@@ -35,13 +35,15 @@ import numpy as np
 import pandas as pd
 
 from aivc_trade.core.logger import get_logger
+from aivc_trade.data.daily_bars import DAILY_FETCH_LIMIT, closed_daily_bars
 
 log = get_logger("htf_gate")
 
 DEFAULT_SYMBOL = "BTCJPY"
 DEFAULT_PERIOD = 200
-#: 取得本数。SMA200 に対し余裕を持たせる（Binance 上限 1000）。
-FETCH_LIMIT = 250
+#: 取得本数。W2 と共通の ``DailyBarCache`` 経由では W2 の必要本数（395 本）を
+#: 含む 500 本を 1 回で取る（Binance の 1 回上限は 1000）。
+FETCH_LIMIT = DAILY_FETCH_LIMIT
 #: 判定できなかったときの再試行間隔（秒）
 RETRY_SECONDS = 600
 #: データ欠損・陳腐化で blocked したときの reason 接頭辞（live の fail-closed）。
@@ -116,11 +118,10 @@ def evaluate_g3(
         return _not_evaluable(symbol, "no daily data (gate open)")
 
     df = daily.sort_values("ts").drop_duplicates("ts", keep="last")
-    ts = pd.to_datetime(df["ts"], utc=True)
-    # 確定足のみ（開始 + 1日 <= now）。当日の足は使わない。
-    # 「開始+1日 <= now」は「開始 <= now-1日」と同じ（境界を含む）。
-    cutoff = pd.Timestamp(now) - timedelta(days=1)
-    closed = df[ts <= cutoff]
+    # 確定足のみ（開始 + 1日 <= now）。当日の足は使わない。整形は W2 と共通
+    # （``data.daily_bars.closed_daily_bars``）＝「開始+1日 <= now」は
+    # 「開始 <= now-1日」と同じ（境界を含む）。
+    closed = closed_daily_bars(df, now)
     if len(closed) < 1:
         return _not_evaluable(symbol, "no closed daily bar yet (gate open)")
 
