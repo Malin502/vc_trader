@@ -57,6 +57,35 @@ def _side_value(side: Any) -> str:
     return getattr(side, "value", str(side))
 
 
+def gate_record(
+    status: Dict[str, Any],
+    *,
+    ts: Optional[datetime] = None,
+    mode: str = "live",
+    level: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """GATE レコードを組み立てる（G3 / W2 共通の形）.
+
+    ``status`` は ``GateStatus.as_dict()`` / ``W2Status.as_dict()`` の戻り値
+    （``gate`` / ``enabled`` / ``blocked`` / ``ok`` / ``state`` / ``reason`` /
+    ``symbol`` など）。``ok=False``（判定不能・データ失敗）は ``level=WARNING``。
+
+    ライブの ``SignalJournal.record_gate`` もシャドーのブロック記録も同じ関数を
+    通すので、**同じ形**で読める（ジャーナルを跨いだ集計ができる）。
+    """
+    record: Dict[str, Any] = {
+        "event": EVENT_GATE,
+        "ts": _iso(ts or datetime.now(timezone.utc)),
+        "mode": str(mode),
+        "level": level or ("INFO" if status.get("ok") else "WARNING"),
+    }
+    record.update(status)
+    if extra:
+        record.update(extra)
+    return record
+
+
 def slippage_bps(price: float, expected: float, side: str = "BUY") -> Optional[float]:
     """約定価格が想定からどれだけ離れたか（bps、不利方向を正）。
 
@@ -236,13 +265,7 @@ class SignalJournal:
         live の fail-closed では ``ok=False`` かつ ``blocked=True``
         （``reason`` が ``data_unavailable: ...``）になり、新規エントリーは止まる。
         """
-        record: Dict[str, Any] = {
-            "event": EVENT_GATE,
-            "ts": _iso(ts or datetime.now(timezone.utc)),
-            "mode": self.mode,
-            "level": "INFO" if status.get("ok") else "WARNING",
-        }
-        record.update(status)
+        record = gate_record(status, ts=ts, mode=self.mode)
         self._stamp(record, extra)
         self.append(record)
         return record

@@ -295,3 +295,54 @@ Step 2b で暫定採用した W2（ボラ連動の間引き）を live / shadow 
 
 5. **範囲外**: W1（サイズ半減）と W3（ストップ連敗ブレーキ）は live 未結線のまま
    （`enabled: false`）。評価側の意味論・バックテストには手を入れていない。
+
+---
+
+## 12. シャドー観測への W2 結線（2026-11-20）
+
+再入場判定の標本を**実運用と同一条件**で生成するため、W2 をシャドー（SOLJPY）にも
+結線した。G3 はすでにシャドーへ適用済み（§10）。ペーパー構成・設定値は変えていない。
+
+1. **判定は共通実装**。`main_live` が持つ `W2Tracker` の状態（`vol_gate`）を
+   `ShadowObserver.on_bar(vol_gate=...)` にそのまま渡し、`generate_signals` の中で
+   live と同じ `evaluate_w2` / `whipsaw.w2` 設定が判定する。シャドー専用の
+   設定キー・判定コードは無い。
+
+2. **対象銘柄**。`W2Tracker` の対象を `exchange.symbols` から
+   `watched_symbols(cfg)`（運用 3 銘柄 ＋ シャドー SOLJPY）に広げた。日足は
+   `DailyBarCache` 経由で G3 と共有するので、増える取得は **SOLJPY の 1 日 1 回**
+   だけ（UTC 日付が変わった後の最初のループで更新）。
+
+3. **ブロックの記録**。W2 が止めたシャドー候補は、シャドーのジャーナル
+   （`shadow.journal_path`）に `GATE` レコードとして残す。形はライブの G3 / W2 の
+   `GATE` と同一（`ops/signal_journal.gate_record` を共用）で、`mode: "shadow"`
+   と `bar_idx` だけがシャドー固有:
+
+   ```json
+   {"event": "GATE", "ts": "2026-11-21T05:00:00+00:00", "mode": "shadow", "level": "INFO",
+    "gate": "W2", "enabled": true, "blocked": true, "ok": true, "state": "high_vol",
+    "reason": "SOLJPY rv30 0.12250 > p90 0.01088", "symbol": "SOLJPY",
+    "rv": 0.12250024174306984, "threshold": 0.010875859208629159,
+    "bar_ts": "2026-11-20T00:00:00+00:00", "n_closed": 500, "bar_idx": 42}
+   ```
+
+   - `state` は `high_vol`（高ボラ）/ `data_error`（データ失敗＝fail-closed、
+     `ok=false`・`level=WARNING`）/ `insufficient_history`（`block` 設定時のみ）
+   - 記録は **エントリー条件を通過した候補だけ**。W2 の判定をエントリー条件の後に
+     置いたので、`GATE` がある＝「建てるはずだったが W2 で止めた」、無い＝
+     「そもそもシグナルが無い（レジーム・クールダウン等）」と後から区別できる。
+   - 集計は `ops.shadow.load_shadow_gate_records(path, gate="W2")` で読める。
+   - 同じ理由で live 側の `generate_signals` でも W2 の判定位置をエントリー条件の
+     後に揃えた（通す/止める集合は位置に依存しない。W2 は銘柄ごと・他条件と独立）。
+
+4. **結線前の状態（記録として）**: W2 を `config.paper.yaml` で有効化した `51af45d`
+   以降、シャドーは `vol_gate` を受け取っていなかったため、`whipsaw_block_reason` の
+   「列 `w2_ok` が無い＝fail-safe でブロック」に落ちていた（起動ログに
+   `whipsaw w2 is enabled but the feature row has no w2_ok column`）。つまり
+   **ライブは正しく W2 を適用、シャドーは常時停止**（＝新しい標本が積まれない）。
+   本結線で解消。以後の `SHADOW_ENTRY` は W2 通過後の標本になる。
+
+5. **既知の非対称（未変更）**: G3 のブロックはシャドーのジャーナルには残らない
+   （`htf_gate` が blocked の間は `generate_signals` が早期に空を返すため）。
+   「G3 で止まった / シグナル無し」をシャドー側だけで区別したい場合は、同じ
+   `gate_record` で `gate=G3` を残す追補が要る（今回は依頼範囲外）。

@@ -350,6 +350,11 @@ def main() -> None:
     #   取得失敗・陳腐化・欠け）」のときだけ。証拠の不在（履歴不足）はリスクとして
     #   扱わない＝既定は pass（評価実装と同じ）。whipsaw.w2.on_insufficient_history
     #   を block にすると安全側（履歴不足でも止める）に切り替えられる。
+    #
+    # 対象は **運用銘柄＋シャドー銘柄**（``watched_symbols``）。シャドー
+    # （SOLJPY）も live と同じ条件で判定する必要があるため（2026-11-20 裁定:
+    # 再入場判定の標本を実運用と同一条件で生成する）。日足は G3 と共有の
+    # ``daily_cache`` を通るので、増える取得は SOLJPY の 1 日 1 回だけ。
     def _on_w2_change(status: Any) -> None:
         signal_journal.record_gate(status.as_dict(), ts=clock.now())
         if status.state == STATE_DATA_ERROR:
@@ -363,7 +368,7 @@ def main() -> None:
             )
 
     w2 = W2Tracker(
-        cfg, daily_cache.as_fetch(clock.now), symbols, on_change=_on_w2_change
+        cfg, daily_cache.as_fetch(clock.now), watched_symbols(cfg), on_change=_on_w2_change
     )
     if w2.enabled:
         w2cfg = w2_config(cfg)
@@ -371,7 +376,7 @@ def main() -> None:
             f"W2 enabled: per-symbol rv{w2cfg['vol_window_days']} > "
             f"p{int(round(w2cfg['percentile'] * 100))} of {w2cfg['ref_window_days']}d "
             f"(insufficient_history={w2cfg['on_insufficient_history']}, "
-            f"data_error=block, symbols={','.join(symbols)})"
+            f"data_error=block, symbols={','.join(w2.symbols)})"
         )
     else:
         log.info("W2 disabled (whipsaw.w2.enabled=false)")
@@ -880,6 +885,9 @@ def main() -> None:
                             feat_1h,
                             shadow_bar_idx,
                             htf_gate=g3.status if g3.enabled else None,
+                            # W2 も live と同じ判定・設定をそのまま渡す（銘柄ごと）。
+                            # 止めた候補はシャドーのジャーナルに GATE として残る。
+                            vol_gate=w2.statuses if w2.enabled else None,
                         )
                         if events:
                             log.info(f"Shadow events this bar: {len(events)}")

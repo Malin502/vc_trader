@@ -18,6 +18,10 @@ MS6 で SOLJPY は運用対象から外れた（仕様 v2 §8）が、観測は�
 * シャドーは仮想資金で 1 銘柄 1 ポジションまで。実運用の枠（max_concurrent）とは
   独立に評価する（＝「そのシグナル単体の期待値」を見る）。
 * 記録は追記のみ。プロセス再起動を跨いで件数が積み上がる。
+* **ゲートは実運用と同一条件**（2026-11-20）。G3 と W2 の判定は live と同じ実装・
+  同じ設定をそのまま受け取る（``vol_gate`` / ``htf_gate``）。W2 が止めた候補は
+  ライブの ``GATE`` と同形のレコード（``gate=W2``・``reason`` つき）として
+  ジャーナルに残すので、再入場判定の集計で「シグナル無し」と区別できる。
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ from aivc_trade.core.logger import get_logger
 from aivc_trade.core.types import Position, TradeRecord
 from aivc_trade.backtest.simulator import Simulator
 from aivc_trade.execution.position_manager import PositionManager
+from aivc_trade.ops.signal_journal import EVENT_GATE, gate_record
 from aivc_trade.strategy.signal import generate_signals
 
 log = get_logger("shadow")
@@ -44,6 +49,9 @@ log = get_logger("shadow")
 EVENT_ENTRY = "SHADOW_ENTRY"
 EVENT_PARTIAL = "SHADOW_PARTIAL_TP"
 EVENT_EXIT = "SHADOW_EXIT"
+#: シャドー候補をゲート（現在は W2）が止めた記録。ライブの ``GATE`` と同形
+#: （``ops.signal_journal.gate_record`` を共用）。「シグナル無し」と区別するために残す。
+EVENT_BLOCK = EVENT_GATE
 
 DEFAULT_MIN_TRADES = 20
 DEFAULT_SLIPPAGE_BPS = 5.0
@@ -95,6 +103,35 @@ def load_shadow_records(path: str | Path) -> List[Dict[str, Any]]:
                 continue
             if isinstance(rec, dict) and rec.get("event") == EVENT_EXIT:
                 out.append(rec)
+    return out
+
+
+def load_shadow_gate_records(
+    path: str | Path, gate: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Read ``GATE`` records (W2 ブロック等) back from a shadow journal.
+
+    ``gate`` を与えると ``gate=W2`` などで絞る。再入場判定の集計で
+    「シグナル無し」と「W2 でブロック」を分けて数えるための入口。
+    """
+    p = Path(path)
+    if not p.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    with open(p, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not (isinstance(rec, dict) and rec.get("event") == EVENT_BLOCK):
+                continue
+            if gate is not None and rec.get("gate") != gate:
+                continue
+            out.append(rec)
     return out
 
 
@@ -235,13 +272,20 @@ class ShadowObserver:
         features_1h: Dict[str, pd.DataFrame],
         bar_idx: int = 0,
         htf_gate: Optional[Any] = None,
+        vol_gate: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Advance the shadow book by one closed 1h bar.
 
         ``htf_gate`` は live と同じ G3 状態（``strategy.htf_gate.GateStatus``）。
         実エントリーと同じ条件で止めるため、そのまま ``generate_signals`` に渡す。
 
-        Returns the journal records emitted on this bar (entry / partial / exit).
+        ``vol_gate`` は live と同じ W2 状態（``{symbol: W2Status}``、
+        ``strategy.whipsaw_live``）。判定関数・設定は live と共通のものを使い、
+        シャドー専用の設定は持たない。W2 が止めた候補は ``GATE`` レコードとして
+        ジャーナルに残す（``gate=W2``・``reason`` つき。ライブの G3/W2 と同じ形）。
+
+        Returns the journal records emitted on this bar (entry / partial / exit /
+        ブロック記録)。
         """
         if not self.enabled:
             return []
@@ -274,6 +318,7 @@ class ShadowObserver:
 
         # --- new shadow entries ---
         held = list(self.positions.values())
+        blocked: List[Any] = []
         signals = generate_signals(
             feat_at,
             {},
@@ -283,7 +328,15 @@ class ShadowObserver:
             cooldowns_bar=self._cooldowns_bar,
             current_bar_idx=bar_idx,
             htf_gate=htf_gate,
+            vol_gate=vol_gate,
+            # W2 が止めた「建てるはずだった候補」を受け取る（判定は共通実装のまま）
+            blocked_out=blocked,
         )
+        for status in blocked:
+            if status is None:  # 状態が無い＝fail-safe で止めた場合（記録は残す）
+                status = {"gate": "W2", "blocked": True, "ok": False,
+                          "state": "missing_status", "reason": "W2 status missing"}
+            events.append(self._record_gate(status, ts, bar_idx))
         for sig in signals:
             if sig.symbol in self.positions:
                 continue
@@ -316,6 +369,25 @@ class ShadowObserver:
     # ------------------------------------------------------------------
     # Journal records
     # ------------------------------------------------------------------
+    def _record_gate(self, status: Any, ts: datetime, bar_idx: int) -> Dict[str, Any]:
+        """W2 が止めたシャドー候補を ``GATE`` レコードとして残す（ライブと同形）.
+
+        ライブの ``SignalJournal.record_gate`` と同じ ``gate_record`` を使うので、
+        ``gate`` / ``state`` / ``blocked`` / ``ok`` / ``reason`` / ``symbol`` /
+        ``rv`` / ``threshold`` / ``bar_ts`` が同じ意味で読める。``mode="shadow"``
+        でライブのジャーナルと区別でき、``bar_idx`` でシャドーのバー位置が分かる。
+        """
+        as_dict = status.as_dict() if hasattr(status, "as_dict") else dict(status)
+        record = gate_record(
+            as_dict, ts=ts, mode="shadow", extra={"bar_idx": int(bar_idx)}
+        )
+        _append_jsonl(self.journal_path, record)
+        log.info(
+            f"SHADOW blocked by {record.get('gate')}: {record.get('symbol')} "
+            f"state={record.get('state')} ({record.get('reason')})"
+        )
+        return record
+
     def _record_entry(self, signal: Any, pos: Position, ts: datetime) -> Dict[str, Any]:
         trade_id = f"{ts.strftime('%Y%m%dT%H%M%S')}-{pos.symbol}"
         self._trade_ids[pos.symbol] = trade_id
