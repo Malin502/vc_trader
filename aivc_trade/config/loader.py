@@ -2,7 +2,7 @@
 
 Derived values injected by :func:`load_config`:
 
-* ``exchange.env``         – normalised to ``prod`` / ``testnet``
+* ``exchange.env``         – normalised to ``prod`` / ``testnet`` / ``paper``
 * ``sizing.risk_per_trade`` – effective per-trade risk for the active ``risk_mode``
 
 The API host is intentionally **not** injected: call :func:`resolve_base_url`
@@ -22,7 +22,7 @@ import yaml
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
-EXCHANGE_ENVS = ("prod", "testnet")
+EXCHANGE_ENVS = ("prod", "testnet", "paper")
 RISK_MODES = ("paper", "live")
 STOP_ORDER_TYPES = ("STOP_LOSS", "STOP_LOSS_LIMIT")
 
@@ -122,14 +122,23 @@ def watched_symbols(cfg: Dict[str, Any]) -> list:
     return out
 
 
+def is_paper_env(cfg: Dict[str, Any]) -> bool:
+    """True when ``exchange.env`` is ``paper`` (実板ペーパー)."""
+    env = str((cfg.get("exchange", {}) or {}).get("env") or "prod").strip().lower()
+    return env == "paper"
+
+
 def resolve_base_url(cfg: Dict[str, Any]) -> str:
     """Return the API base URL for the configured ``exchange.env``.
 
     ``prod`` reads ``exchange.base_url`` (``https://api.binance.com`` — Binance
     Japan runs on the global platform, so the global API host is correct),
-    ``testnet`` reads ``exchange.testnet_base_url``.  Raises ``ValueError`` when
-    the selected host is missing so a misconfigured deployment fails fast
-    instead of silently trading against the wrong venue.
+    ``testnet`` reads ``exchange.testnet_base_url``, and ``paper`` reads
+    ``exchange.base_url`` as well: 実板ペーパーは **本番の公開エンドポイント**
+    だけを使い、発注はしない（署名付き経路は存在しない）。
+
+    Raises ``ValueError`` when the selected host is missing so a misconfigured
+    deployment fails fast instead of silently trading against the wrong venue.
     """
     exchange = cfg.get("exchange", {})
     env = str(exchange.get("env") or "prod").strip().lower()
@@ -138,7 +147,7 @@ def resolve_base_url(cfg: Dict[str, Any]) -> str:
             f"Invalid config: exchange.env must be one of {EXCHANGE_ENVS}, got {env!r}"
         )
 
-    key = "base_url" if env == "prod" else "testnet_base_url"
+    key = "testnet_base_url" if env == "testnet" else "base_url"
     url = str(exchange.get(key) or "").strip().rstrip("/")
     if not url:
         raise ValueError(
@@ -164,6 +173,7 @@ def _validate_config(cfg: Dict[str, Any]) -> None:
     _validate_shadow(cfg)
     _validate_orderbook(cfg)
     _validate_whipsaw(cfg)
+    _validate_paper(cfg)
 
     risk_cfg = cfg.get("risk", {})
     initial_sl = risk_cfg.get("initial_sl", {})
@@ -422,6 +432,21 @@ def _validate_orderbook(cfg: Dict[str, Any]) -> None:
     timeout = float(ob.get("timeout_s", 5.0))
     if timeout <= 0:
         raise ValueError("Invalid config: orderbook.timeout_s must be > 0")
+
+
+def _validate_paper(cfg: Dict[str, Any]) -> None:
+    """実板ペーパー（``exchange.env: paper``）の設定値."""
+    paper = cfg.get("paper") or {}
+    if not paper:
+        return
+
+    equity = float(paper.get("initial_equity", 0.0) or 0.0)
+    if equity <= 0:
+        raise ValueError("Invalid config: paper.initial_equity must be > 0")
+
+    fallback = float(paper.get("fallback_slippage_bps", 0.0) or 0.0)
+    if fallback < 0:
+        raise ValueError("Invalid config: paper.fallback_slippage_bps must be >= 0")
 
 
 def _validate_whipsaw(cfg: Dict[str, Any]) -> None:

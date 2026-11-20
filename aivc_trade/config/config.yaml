@@ -4,7 +4,9 @@
 
 exchange:
   name: binance
-  # prod | testnet — loader.resolve_base_url() が接続先を切り替える
+  # prod | testnet | paper
+  #   paper = 実板ペーパー: 本番の公開データ（認証不要）+ 実際の板での模擬約定。
+  #           API キーを読まず、署名付き経路を作らない（Testnet の置き換え）。
   env: prod
   # prod 用 API ホスト。Binance Japan の公式サービスはグローバル基盤
   # (binance.com/ja) 上にあり、API も api.binance.com が正。
@@ -297,6 +299,14 @@ shadow:
   commission_bps: 10.0       # 片道手数料
   initial_equity: 100000.0   # シャドーの仮想資金（サイズ計算用）
   cooldown_bars: 0           # 0 = position.cooldown/entry.cooldown_bars に従う
+
+# ---------- 実板ペーパー（exchange.env: paper） ----------
+# 本番の公開エンドポイント（api.binance.com、認証不要）から足と板を取り、
+# 実際の板の厚みを消費して約定価格・スリッページを決める。実注文は出さない。
+paper:
+  initial_equity: 100000.0        # 模擬口座の初期資金（quote 建て）
+  fallback_slippage_bps: 5.0      # 板が取れないときの片道スリッページ
+  account_file: data/paper/paper_account.json   # 仮想口座（再起動で維持）
 
 # ---------- Signal-time order book snapshot (MS6 Step3) ----------
 orderbook:

@@ -12,8 +12,9 @@ import signal
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 # Allow `python aivc_trade/main_live.py` from any cwd.
 if __package__ in (None, ""):
@@ -22,6 +23,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from aivc_trade.config.loader import (
+    is_paper_env,
     load_config,
     resolve_base_url,
     shadow_symbols,
@@ -31,6 +33,7 @@ from aivc_trade.core.clock import clock
 from aivc_trade.core.logger import get_logger, setup_logger
 from aivc_trade.core.types import ExitReason, Position, Regime, Side, SystemState
 from aivc_trade.data.binance_client import BinanceClient
+from aivc_trade.data.public_client import PublicMarketClient
 from aivc_trade.data.candles_store import CandlesStore
 from aivc_trade.data.feature_engine import compute_features_1h, compute_features_5m
 from aivc_trade.data.orderbook import OrderBookRecorder
@@ -40,6 +43,8 @@ from aivc_trade.strategy.sizing import compute_qty, round_down_step
 from aivc_trade.strategy.risk import CircuitBreaker
 from aivc_trade.execution.order_manager import OrderManager
 from aivc_trade.execution.position_manager import PositionManager
+from aivc_trade.execution.paper_broker import PaperBroker
+from aivc_trade.execution.paper_stop import PaperStopManager
 from aivc_trade.execution.stop_order_manager import StopOrderManager
 from aivc_trade.execution.broker import LiveBroker
 from aivc_trade.ops.healthcheck import HealthCheck
@@ -145,6 +150,75 @@ def _resize_exchange_stop(
     return bool(state is not None and state.is_open)
 
 
+@dataclass
+class ExchangeStack:
+    """``exchange.env`` に応じた実行系の束.
+
+    ``paper`` では ``client`` が公開データ専用クライアント、``broker`` が模擬
+    ブローカー、``stop_om`` が模擬 STOP、``account`` が仮想口座（残高照会用）。
+    ``prod`` / ``testnet`` は従来どおり署名クライアント + 実発注。
+    """
+
+    env: str
+    is_paper: bool
+    base_url: str
+    client: Any
+    broker: Any
+    stop_om: Any
+    account: Any
+
+
+def build_exchange_stack(
+    cfg: Dict[str, Any],
+    *,
+    alert_fn: Optional[Callable[[str], None]] = None,
+) -> ExchangeStack:
+    """実板ペーパー / testnet / prod の実行系を env から組み立てる.
+
+    安全ガード（実板ペーパー）:
+
+    * ``exchange.env: paper`` では **API キーを一切読まない**（config の
+      ``secrets`` も環境変数も参照しない）
+    * 生成するのは :class:`PublicMarketClient` のみで、署名コードを持たない
+    * 発注経路は :class:`PaperBroker`、保護は :class:`PaperStopManager`
+    """
+    env = str((cfg.get("exchange", {}) or {}).get("env") or "prod").strip().lower()
+    base_url = resolve_base_url(cfg)
+
+    if env == "paper":
+        client = PublicMarketClient(base_url=base_url)
+        broker = PaperBroker(client, cfg)
+        stop_om = PaperStopManager(cfg)
+        log.info(
+            "PAPER mode: public endpoints only (no API key, no signed client, "
+            "fills simulated against the real book)"
+        )
+        return ExchangeStack(
+            env=env,
+            is_paper=True,
+            base_url=base_url,
+            client=client,
+            broker=broker,
+            stop_om=stop_om,
+            account=broker,
+        )
+
+    api_key = cfg.get("secrets", {}).get("api_key", os.environ.get("BINANCE_API_KEY", ""))
+    api_secret = cfg.get("secrets", {}).get(
+        "api_secret", os.environ.get("BINANCE_API_SECRET", "")
+    )
+    client = BinanceClient(api_key=api_key, api_secret=api_secret, base_url=base_url)
+    return ExchangeStack(
+        env=env,
+        is_paper=False,
+        base_url=base_url,
+        client=client,
+        broker=LiveBroker(client, cfg),
+        stop_om=StopOrderManager(client, cfg, alert_fn=alert_fn),
+        account=client,
+    )
+
+
 def main() -> None:
     setup_logger()
     _install_signal_handlers()
@@ -155,15 +229,6 @@ def main() -> None:
     log.info("=" * 50)
 
     # --- Initialise components ---
-    api_key = cfg.get("secrets", {}).get("api_key", os.environ.get("BINANCE_API_KEY", ""))
-    api_secret = cfg.get("secrets", {}).get("api_secret", os.environ.get("BINANCE_API_SECRET", ""))
-
-    # Endpoint comes from config (exchange.env → base_url / testnet_base_url) with
-    # AIVC_EXCHANGE_ENV / BINANCE_BASE_URL as env overrides, so switching to the
-    # testnet for the M4b run needs no code change.
-    base_url = resolve_base_url(cfg)
-    client = BinanceClient(api_key=api_key, api_secret=api_secret, base_url=base_url)
-    log.info(f"Exchange endpoint: {base_url} (env={cfg['exchange']['env']})")
     # Quote asset is config-driven so the symbol set can change (JPY pairs) without
     # touching the loop. Default keeps the historical USDC behaviour.
     quote_asset = str(cfg.get("exchange", {}).get("quote_asset", "USDC"))
@@ -176,29 +241,20 @@ def main() -> None:
     store = CandlesStore(cfg["persistence"]["candles_dir"])
     om = OrderManager(cfg)
     pm = PositionManager(cfg)
-    broker = LiveBroker(client, cfg)
     cb = CircuitBreaker(cfg)
     hc = HealthCheck()
     notifier = DiscordNotifier(cfg["notification"]["discord_webhook_url"])
     state_mgr = StateManager(cfg["persistence"]["state_file"])
+    paper = is_paper_env(cfg)
 
     # --- MS6 Step3: シグナル時点の板スナップショット ---
-    book_recorder = OrderBookRecorder(client, cfg)
+    # ジャーナルは実行系より先に作る。実板ペーパーでは全レコードに
+    # ``venue=paper_mock`` を付け、実約定と機械的に区別できるようにする。
     signal_journal = SignalJournal(
         cfg["persistence"]["signal_journal_path"],
         mode=str(cfg.get("sizing", {}).get("risk_mode", "live")),
+        defaults={"venue": "paper_mock", "execution": "simulated"} if paper else None,
     )
-    # --- MS6 Step2: 運用対象外シンボルのシャドー観測 ---
-    shadow = ShadowObserver(cfg)
-    shadow_flag_path = (cfg.get("shadow", {}) or {}).get("flag_path")
-    shadow_flag_written = False
-    last_shadow_bar_ts = None
-    shadow_bar_idx = 0
-    if shadow_syms:
-        log.info(
-            f"Shadow observation: {', '.join(shadow_syms)} "
-            f"(no orders; journal={shadow.journal_path})"
-        )
 
     # --- M4: exchange-side STOP_LOSS (安全網) ---
     # The bot keeps its own close-based trailing logic; this manager only keeps
@@ -213,7 +269,39 @@ def main() -> None:
             symbol="*", kind="RATCHET_ALERT", ok=False, detail=message,
         )
 
-    stop_om = StopOrderManager(client, cfg, alert_fn=_on_stop_alert)
+    # Endpoint comes from config (exchange.env → base_url / testnet_base_url) with
+    # AIVC_EXCHANGE_ENV / BINANCE_BASE_URL as env overrides, so switching between
+    # prod / testnet / paper needs no code change.  In ``paper`` this factory
+    # never reads credentials and never builds a signed client.
+    stack = build_exchange_stack(cfg, alert_fn=_on_stop_alert)
+    client = stack.client
+    broker = stack.broker
+    stop_om = stack.stop_om
+    account = stack.account
+    base_url = stack.base_url
+    log.info(f"Exchange endpoint: {base_url} (env={stack.env})")
+    if stack.is_paper:
+        log.info(
+            "PAPER mode (実板ペーパー): 本番公開データ + 模擬約定 / "
+            "署名付き経路なし・資格情報不要"
+        )
+
+    book_recorder = OrderBookRecorder(client, cfg)
+    # --- MS6 Step2: 運用対象外シンボルのシャドー観測 ---
+    shadow = ShadowObserver(cfg)
+    shadow_flag_path = (cfg.get("shadow", {}) or {}).get("flag_path")
+    shadow_flag_written = False
+    last_shadow_bar_ts = None
+    shadow_bar_idx = 0
+    if shadow_syms:
+        log.info(
+            f"Shadow observation: {', '.join(shadow_syms)} "
+            f"(no orders; journal={shadow.journal_path})"
+        )
+
+    # --- M4: exchange-side STOP_LOSS (安全網) ---
+    # ``stop_om`` は上の build_exchange_stack で構築済み: prod / testnet は
+    # 取引所 STOP、paper は模擬 STOP（価格監視＋模擬約定）。
 
     # --- Restore state ---
     state = state_mgr.load()
@@ -235,7 +323,7 @@ def main() -> None:
         pos = positions[sym]
         try:
             base = _base_asset(sym, quote_asset)
-            actual_qty = client.get_spot_balance(base)
+            actual_qty = account.get_spot_balance(base)
             if actual_qty < pos.qty * 0.95:
                 log.warning(
                     f"Position drift: expected {pos.qty} {base} ({sym}), "
@@ -539,6 +627,25 @@ def main() -> None:
                                         f"{sym}: stop rollback after failed partial TP failed"
                                     )
 
+                # --- 実板ペーパー: 模擬 STOP の価格監視（取引所 STOP の代替）---
+                # 板に常駐 STOP は置けないので、毎ループの現在値で到達判定する。
+                # 到達したらジャーナルに TRIGGERED（venue=paper_mock）を残し、
+                # 約定自体は下の通常の決済経路（模擬ブローカー＝実板）で行う。
+                stop_trigger = None
+                if stack.is_paper:
+                    stop_trigger = stop_om.poll_trigger(sym, current_close, ts=now)
+                    if stop_trigger is not None:
+                        signal_journal.record_stop(
+                            symbol=sym, kind="TRIGGERED", ok=True, ts=now,
+                            step="monitor", stop_price=stop_trigger["stop_price"],
+                            qty=stop_trigger["qty"],
+                            order_id=stop_trigger["order_id"],
+                            detail=(
+                                f"price {current_close} <= stop "
+                                f"{stop_trigger['stop_price']} (simulated stop)"
+                            ),
+                        )
+
                 # Check exit
                 exit_reason = pm.check_exit(
                     position, current_close, current_atr, regime, now,
@@ -546,6 +653,9 @@ def main() -> None:
                     current_adx=current_adx,
                     trend_ma=trend_ma_val,
                 )
+                if stop_trigger is not None:
+                    # 模擬 STOP 到達は常に STOP_LOSS として扱う（決済理由の整合）。
+                    exit_reason = ExitReason.STOP_LOSS
                 if exit_reason is None:
                     continue
 
@@ -570,7 +680,19 @@ def main() -> None:
                     price=exit_price, ts=now, kind="EXIT",
                     fee=exit_order.fee, fee_asset=exit_order.fee_asset,
                     order_id=exit_order.order_id,
-                    extra={"reason": exit_reason.value, "pnl": round(pnl, 4)},
+                    extra={
+                        "reason": exit_reason.value,
+                        "pnl": round(pnl, 4),
+                        **(
+                            {
+                                "stop_kind": "PAPER_MOCK",
+                                "stop_price": stop_trigger["stop_price"],
+                                "trigger_price": stop_trigger["trigger_price"],
+                            }
+                            if stop_trigger is not None
+                            else {}
+                        ),
+                    },
                 )
                 # M4: 決済が約定してから安全網の stop を取り消す。キャンセル失敗は
                 # 握りつぶさずエラーとして表面化させ、孤児 stop として次ループで
@@ -596,7 +718,7 @@ def main() -> None:
 
                 # Equity snapshot + circuit breaker (best effort, post-fill)
                 try:
-                    quote_balance = client.get_account_balance(quote_asset)
+                    quote_balance = account.get_account_balance(quote_asset)
                     state.equity_snapshots.append(
                         {"ts": now.isoformat(), "equity": quote_balance}
                     )
@@ -691,7 +813,7 @@ def main() -> None:
                 equity = 0.0
                 if signals:
                     try:
-                        equity = client.get_account_balance(quote_asset)
+                        equity = account.get_account_balance(quote_asset)
                     except Exception as e:
                         log.error(f"Balance fetch failed – skipping entries: {e}")
                         notifier.notify_error(f"Balance fetch failed: {e}")

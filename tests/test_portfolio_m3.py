@@ -448,7 +448,10 @@ class TestMainLiveWiring:
         source = inspect.getsource(main_live)
         assert source.count("M4:") >= 3
         # Step 1': ラチェット失敗のエスカレーション用に alert_fn を渡す。
-        assert "StopOrderManager(client, cfg, alert_fn=_on_stop_alert)" in source
+        # 実板ペーパー対応で実行系の組み立ては build_exchange_stack に移り、
+        # main 側の closure（_on_stop_alert）をそこへ渡す形になった。
+        assert "alert_fn=_on_stop_alert" in source
+        assert "StopOrderManager(client, cfg, alert_fn=alert_fn)" in source
 
 
 # ----------------------------------------------------------------------

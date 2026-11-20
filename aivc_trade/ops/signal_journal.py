@@ -76,10 +76,20 @@ class SignalJournal:
         mode: str = "live",
         *,
         enabled: bool = True,
+        defaults: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.path = Path(path)
         self.mode = str(mode)
         self.enabled = bool(enabled)
+        #: 全レコードに付ける既定フィールド（実板ペーパーは ``venue=paper_mock``）。
+        #: 約定が模擬であることを後から機械的に見分けるために使う。
+        self.defaults: Dict[str, Any] = dict(defaults or {})
+
+    def _stamp(self, record: Dict[str, Any], extra: Optional[Dict[str, Any]]) -> None:
+        for key, value in self.defaults.items():
+            record.setdefault(key, value)
+        if extra:
+            record.update(extra)
 
     # ------------------------------------------------------------------
     # SIGNAL
@@ -120,8 +130,7 @@ class SignalJournal:
             "stop_price": float(signal.stop_price),
             "orderbook": orderbook,
         }
-        if extra:
-            record.update(extra)
+        self._stamp(record, extra)
 
         self.append(record)
         return record
@@ -166,8 +175,7 @@ class SignalJournal:
             "fee_asset": str(fee_asset or ""),
             "order_id": str(order_id) if order_id else None,
         }
-        if extra:
-            record.update(extra)
+        self._stamp(record, extra)
         self.append(record)
         return record
 
@@ -207,8 +215,7 @@ class SignalJournal:
             "order_id": str(order_id) if order_id else None,
             "detail": detail,
         }
-        if extra:
-            record.update(extra)
+        self._stamp(record, extra)
         self.append(record)
         return record
 
